@@ -9,8 +9,9 @@ import pytest
 from mcp.server.fastmcp.exceptions import ToolError
 
 from nc_mcp_server.tools import collectives
+from nc_mcp_server.tools.circles import get_team_folder
 
-from .conftest import McpTestHelper
+from .conftest import McpTestHelper, team_folders_expected
 
 pytestmark = pytest.mark.integration
 
@@ -45,7 +46,7 @@ async def _destroy_collective(nc_mcp: McpTestHelper, collective_id: int) -> None
     with contextlib.suppress(Exception):
         await nc_mcp.call("trash_collective", collective_id=collective_id)
     with contextlib.suppress(Exception):
-        await nc_mcp.call("delete_collective", collective_id=collective_id, delete_team=True)
+        await nc_mcp.call("delete_collective", collective_id=collective_id, delete_team=True, delete_team_folder=True)
 
 
 async def _teams(nc_mcp: McpTestHelper) -> list[dict[str, Any]]:
@@ -351,9 +352,24 @@ class TestTrashAndRestoreCollective:
         coll = await _create_collective(nc_mcp, "permdel")
         try:
             assert coll["name"] in await _team_names(nc_mcp)
+            team = next(t for t in await _teams(nc_mcp) if t.get("name") == coll["name"])
+            folder = await get_team_folder(nc_mcp.client, team["id"])
+            assert (folder is not None) == team_folders_expected()
+            assert coll.get("team_folder") == (folder and folder["mountPoint"])
             await nc_mcp.call("trash_collective", collective_id=coll["id"])
-            result = await nc_mcp.call("delete_collective", collective_id=coll["id"], delete_team=True)
-            assert result.endswith("deleted permanently with its team.")
+            if folder is None:
+                result = await nc_mcp.call("delete_collective", collective_id=coll["id"], delete_team=True)
+                assert result.endswith("deleted permanently with its team.")
+            else:
+                # Nextcloud 35 with the Team folders app gives a new collective's team a team folder
+                with pytest.raises(ToolError, match=r"team folder .*Nothing was changed"):
+                    await nc_mcp.call("delete_collective", collective_id=coll["id"], delete_team=True)
+                assert coll["name"] in await _team_names(nc_mcp)
+                assert await get_team_folder(nc_mcp.client, team["id"]) == folder
+                result = await nc_mcp.call(
+                    "delete_collective", collective_id=coll["id"], delete_team=True, delete_team_folder=True
+                )
+                assert result.endswith(f"with its team and team folder '{folder['mountPoint']}'.")
             assert coll["name"] not in await _team_names(nc_mcp)
         finally:
             await _destroy_collective(nc_mcp, coll["id"])
@@ -370,7 +386,7 @@ class TestTrashAndRestoreCollective:
             for team in await _teams(nc_mcp):
                 if team.get("name") == coll["name"]:
                     with contextlib.suppress(Exception):
-                        await nc_mcp.call("delete_circle", circle_id=team["id"])
+                        await nc_mcp.call("delete_circle", circle_id=team["id"], delete_team_folder=True)
 
 
 class TestTrashAndRestorePage:
@@ -870,4 +886,4 @@ class TestCollectivePermissions:
             with contextlib.suppress(Exception):
                 await client.ocs_delete(f"apps/collectives/api/v1.0/collectives/{coll['id']}")
             with contextlib.suppress(Exception):
-                await client.ocs_delete(f"apps/collectives/api/v1.0/collectives/trash/{coll['id']}")
+                await client.ocs_delete(f"apps/collectives/api/v1.0/collectives/trash/{coll['id']}?circle=1")

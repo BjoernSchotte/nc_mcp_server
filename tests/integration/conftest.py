@@ -1,12 +1,14 @@
 """Integration test fixtures — require a running Nextcloud instance."""
 
 import contextlib
+import functools
 import os
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+import niquests
 import pytest
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ImageContent, TextContent
@@ -15,7 +17,7 @@ from nc_mcp_server.client import NextcloudClient
 from nc_mcp_server.config import Config
 from nc_mcp_server.permissions import PermissionLevel
 from nc_mcp_server.server import create_server
-from nc_mcp_server.state import get_client
+from nc_mcp_server.state import get_client, get_config
 
 pytestmark = pytest.mark.integration
 
@@ -259,3 +261,33 @@ async def _cleanup(client: NextcloudClient) -> None:
     await _cleanup_forms(client)
     await _cleanup_circles(client)
     await _cleanup_cospend(client)
+
+
+@functools.cache
+def team_folders_expected() -> bool:
+    """Whether the server gives new circles team folders: Nextcloud 35+ with the Team folders app, not turned off."""
+    config = get_config()
+    auth = (config.user, config.password)
+    headers = {"OCS-APIRequest": "true", "Accept": "application/json"}
+    status = niquests.get(f"{config.nextcloud_url}/status.php", timeout=10).json()
+    if int(status["version"].split(".")[0]) < 35:
+        return False
+    apps = niquests.get(
+        f"{config.nextcloud_url}/ocs/v2.php/cloud/apps",
+        params={"filter": "enabled"},
+        auth=auth,
+        headers=headers,
+        timeout=10,
+    )
+    apps.raise_for_status()
+    if "groupfolders" not in apps.json()["ocs"]["data"]["apps"]:
+        return False
+    # An admin can turn automatic team folders off; the key is empty while unset (on)
+    toggle = niquests.get(
+        f"{config.nextcloud_url}/ocs/v2.php/apps/provisioning_api/api/v1/config/apps/circles/team_folder_auto_create",
+        auth=auth,
+        headers=headers,
+        timeout=10,
+    )
+    toggle.raise_for_status()
+    return str(toggle.json()["ocs"]["data"]["data"]).lower() not in ("0", "false", "no")

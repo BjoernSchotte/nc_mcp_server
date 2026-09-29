@@ -6,7 +6,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from ..annotations import ADDITIVE, ADDITIVE_IDEMPOTENT, DESTRUCTIVE, READONLY
-from ..client import NextcloudError
+from ..client import NextcloudClient, NextcloudError
 from ..permissions import PermissionLevel, require_permission
 from ..state import get_client
 
@@ -24,6 +24,79 @@ MEMBER_LEVELS = {
     "admin": 8,
     "owner": 9,
 }
+
+NO_TEAM_FOLDER = (
+    "No team folder was created. Team folders need Nextcloud 35 or later with the Team folders app, personal "
+    "circles get none, an admin can turn them off, and the server only logs a failed creation."
+)
+
+
+async def get_team_folder(client: NextcloudClient, circle_id: str) -> dict[str, Any] | None:
+    """The team folder of a team (Nextcloud 35+ with the Team folders app), or None if it has none.
+
+    Deleting a team deletes its team folder with every file in it. Only members may ask; other errors propagate,
+    so callers guarding a deletion refuse instead of guessing.
+    """
+    try:
+        folder: dict[str, Any] = await client.ocs_get(f"apps/circles/teams/{circle_id}/folder")
+    except NextcloudError as e:
+        # 404 covers a team without a folder, a server without a team folder provider, and servers before 35
+        # that have no such route.
+        if e.status_code == 404:
+            return None
+        raise
+    return folder
+
+
+async def _report_team_folder(client: NextcloudClient, circle: dict[str, Any]) -> None:
+    """Add the new circle's team folder, or why there is none, to the circle."""
+    try:
+        circle["team_folder"] = await get_team_folder(client, circle["id"])
+    except NextcloudError as e:
+        # The circle exists already, so report it instead of failing and inviting a duplicate
+        circle["team_folder"] = None
+        circle["team_folder_note"] = f"The circle was created, but its team folder could not be read: {e}"
+        return
+    if circle["team_folder"] is None:
+        circle["team_folder_note"] = NO_TEAM_FOLDER
+    else:
+        # A session that started before the folder existed can miss it for minutes, a new login sees it
+        await client.renew_session()
+
+
+async def team_folder_at_stake(
+    client: NextcloudClient, circle_id: str, delete_team_folder: bool, circle: str
+) -> dict[str, Any] | None:
+    """get_team_folder for a guard before deleting a circle, which circle describes in messages.
+
+    Without delete_team_folder a failed check stops the deletion, and says so. With it the caller has agreed to lose
+    the folder, so an unknown folder does not hold the deletion up; the server still refuses what it would refuse.
+    """
+    try:
+        return await get_team_folder(client, circle_id)
+    except NextcloudError as e:
+        if delete_team_folder:
+            return None
+        what = f"checking the team folder of {circle} first failed"
+        if e.status_code == 403:
+            # Circles also answers 403 for circles that do not exist, and only the owner may delete one anyway
+            what = f"you are not a member of {circle}, or it does not exist; only its owner can delete it"
+        raise unchanged(e, what) from e
+
+
+def unchanged(error: NextcloudError, what: str) -> NextcloudError:
+    """A failed check before a deletion, saying that nothing was deleted."""
+    return NextcloudError(f"Nothing was changed: {what}: {error}", error.status_code)
+
+
+def refuse_team_folder_loss(lead: str, folder: dict[str, Any], advice: str) -> ValueError:
+    """The error for an action that would delete a team folder the caller did not agree to lose.
+
+    lead ends where the folder is named, advice says how to keep it or delete it anyway.
+    """
+    return ValueError(
+        f"{lead} team folder '{folder.get('mountPoint')}' and every file in it. Nothing was changed. {advice}"
+    )
 
 
 def _register_read_tools(mcp: FastMCP) -> None:
@@ -114,7 +187,7 @@ def _register_read_tools(mcp: FastMCP) -> None:
 def _register_circle_writes(mcp: FastMCP) -> None:
     @mcp.tool(annotations=ADDITIVE)
     @require_permission(PermissionLevel.WRITE)
-    async def create_circle(name: str, personal: bool = False, local: bool = False) -> str:
+    async def create_circle(name: str, personal: bool = False, local: bool = False, team_folder: bool = False) -> str:
         """Create a new circle (team).
 
         Args:
@@ -123,18 +196,28 @@ def _register_circle_writes(mcp: FastMCP) -> None:
                 owner (useful for private contact groups).
             local: If True, mark the circle as local (not federated to other
                 instances) even when global scope is enabled.
+            team_folder: If True, also create a team folder: a shared folder
+                every member sees in Files, named after the team (with a
+                number added when that name is taken; see its mountPoint).
+                Needs Nextcloud 35 or later with the Team folders app.
+                Deleting the team later deletes the folder and its files too.
 
         Returns:
             JSON of the new circle including its generated id. The caller is
-            automatically added as owner (level=9).
+            automatically added as owner (level=9). With team_folder, it also
+            has `team_folder` (id, mountPoint, quota) or null with
+            `team_folder_note` saying why none was created.
         """
         client = get_client()
-        body: dict[str, Any] = {"name": name}
+        # Circles on Nextcloud 35 creates a team folder unless told not to; older servers ignore the flag.
+        body: dict[str, Any] = {"name": name, "createTeamFolder": team_folder}
         if personal:
             body["personal"] = True
         if local:
             body["local"] = True
         data = await client.ocs_post_json("apps/circles/circles", json_data=body)
+        if team_folder:
+            await _report_team_folder(client, data)
         return json.dumps(data)
 
     @mcp.tool(annotations=ADDITIVE_IDEMPOTENT)
@@ -215,6 +298,8 @@ def _register_circle_writes(mcp: FastMCP) -> None:
         )
         return json.dumps(data)
 
+
+def _register_membership_tools(mcp: FastMCP) -> None:
     @mcp.tool(annotations=ADDITIVE_IDEMPOTENT)
     @require_permission(PermissionLevel.WRITE)
     async def join_circle(circle_id: str) -> str:
@@ -236,26 +321,43 @@ def _register_circle_writes(mcp: FastMCP) -> None:
 
     @mcp.tool(annotations=DESTRUCTIVE)
     @require_permission(PermissionLevel.DESTRUCTIVE)
-    async def leave_circle(circle_id: str) -> str:
+    async def leave_circle(circle_id: str, delete_team_folder: bool = False) -> str:
         """Leave a circle the current user is a member of.
 
-        IMPORTANT: If the current user is the sole owner, leaving destroys
-        the entire circle (server behavior — no confirmation prompt). To
-        avoid this, promote another member to owner via
-        update_circle_member_level(..., level="owner") first. Because of
-        this implicit-destroy behavior, this tool requires DESTRUCTIVE
+        IMPORTANT: When the owner leaves, the server makes another member the
+        owner (the highest level, then the longest-standing). Any entry of
+        list_circle_members counts, even a group, a nested circle or a
+        pending invitation or join request. When the owner is the last one,
+        leaving destroys the entire circle, with no confirmation prompt.
+        Because of this implicit destroy, this tool requires DESTRUCTIVE
         permission (matching leave_conversation in Talk).
 
         Args:
             circle_id: String circle id.
+            delete_team_folder: Destroying the circle also deletes its team
+                folder (Nextcloud 35+ with the Team folders app) and every file
+                in it. When that would happen, the tool refuses unless this is
+                true.
 
         Returns:
             JSON of the circle the user just left (circle fields: id, name,
             config, population, initiator, …). Empty when the caller loses
-            visibility on the circle after leaving (e.g. sole-owner case
-            where the circle is destroyed).
+            visibility on the circle after leaving (e.g. when the circle is
+            destroyed).
         """
         client = get_client()
+        if not delete_team_folder:
+            try:
+                folder = await _folder_lost_by_leaving(client, circle_id)
+            except NextcloudError as e:
+                raise unchanged(e, "checking whether leaving would delete the circle failed") from e
+            if folder is not None:
+                raise refuse_team_folder_loss(
+                    "Leaving as the owner and last member deletes the circle, and with it its",
+                    folder,
+                    "To keep them, add a member first (the circle then passes to them) or move out what should be "
+                    "kept; to delete the folder too, call again with delete_team_folder=true.",
+                )
         data = await client.ocs_put_json(f"apps/circles/circles/{circle_id}/leave", json_data={})
         return json.dumps(data)
 
@@ -330,6 +432,28 @@ def _register_member_writes(mcp: FastMCP) -> None:
         return json.dumps(data)
 
 
+async def _folder_lost_by_leaving(client: NextcloudClient, circle_id: str) -> dict[str, Any] | None:
+    """The team folder that leaving would delete: the caller is the owner and no other member remains."""
+    try:
+        circle: dict[str, Any] = await client.ocs_get(f"apps/circles/circles/{circle_id}")
+    except NextcloudError as e:
+        # Invited or requesting users can leave without seeing the circle. They are never its owner.
+        if e.status_code in (403, 404):
+            return None
+        raise
+    initiator: dict[str, Any] = circle.get("initiator") or {}
+    if initiator.get("level") != MEMBER_LEVELS["owner"]:
+        return None
+    folder = await get_team_folder(client, circle_id)
+    if folder is None:
+        return None
+    # Circles hands the circle to any other member, even a pending invitation or join request, and destroys it
+    # only when the owner is the last one
+    members: list[dict[str, Any]] = await client.ocs_get(f"apps/circles/circles/{circle_id}/members")
+    others = [m for m in members if m.get("id") != initiator.get("id")]
+    return None if others else folder
+
+
 def _refused_row_lock(message: str) -> bool:
     """Whether the database refused Circles' SELECT ... FOR UPDATE (SQLite, or PostgreSQL on an outer join)."""
     return "FOR UPDATE" in message and ("not supported" in message or "outer join" in message)
@@ -338,18 +462,36 @@ def _refused_row_lock(message: str) -> bool:
 def _register_destructive_tools(mcp: FastMCP) -> None:
     @mcp.tool(annotations=DESTRUCTIVE)
     @require_permission(PermissionLevel.DESTRUCTIVE)
-    async def delete_circle(circle_id: str) -> str:
+    async def delete_circle(circle_id: str, delete_team_folder: bool = False) -> str:
         """Delete a circle. Requires owner level. Removes all memberships.
 
         Args:
             circle_id: String circle id.
+            delete_team_folder: Deleting a circle also deletes its team folder
+                (Nextcloud 35+ with the Team folders app) and every file in it,
+                for all members, also when it is an older group folder an admin
+                linked to the team. If the circle has one, the tool refuses
+                unless this is true.
 
         Returns:
-            Confirmation with the deleted id.
+            Confirmation with the deleted id, and `deleted_team_folder` (the
+            folder's name) when a team folder goes with it. Circles finishes
+            the deletion in the background within seconds.
         """
         client = get_client()
+        folder = await team_folder_at_stake(client, circle_id, delete_team_folder, f"circle {circle_id}")
+        if folder is not None and not delete_team_folder:
+            raise refuse_team_folder_loss(
+                "Deleting this circle would also delete, for all its members, its",
+                folder,
+                "Move out what should be kept first; to delete the folder too, the circle's owner calls again with "
+                "delete_team_folder=true.",
+            )
         await client.ocs_delete(f"apps/circles/circles/{circle_id}")
-        return json.dumps({"deleted_circle_id": circle_id})
+        result: dict[str, Any] = {"deleted_circle_id": circle_id}
+        if folder is not None:
+            result["deleted_team_folder"] = folder.get("mountPoint")
+        return json.dumps(result)
 
     @mcp.tool(annotations=DESTRUCTIVE)
     @require_permission(PermissionLevel.DESTRUCTIVE)
@@ -372,5 +514,6 @@ def register(mcp: FastMCP) -> None:
     """Register Circles (Teams) tools with the MCP server."""
     _register_read_tools(mcp)
     _register_circle_writes(mcp)
+    _register_membership_tools(mcp)
     _register_member_writes(mcp)
     _register_destructive_tools(mcp)
