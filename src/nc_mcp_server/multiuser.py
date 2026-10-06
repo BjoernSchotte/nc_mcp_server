@@ -11,6 +11,12 @@ config whose ``user`` is the request's user ID.
 Rules:
 
 * No header, a malformed header or credentials Nextcloud rejects -> HTTP 401, nothing runs.
+* Exception: discovery without any ``Authorization`` header. A POST whose JSON-RPC messages are all
+  in :data:`DISCOVERY_METHODS` (``initialize``, ``ping``, ``tools/list``, notifications) runs
+  without a login. Clients list tools before they know who asks (OpenClaw does at startup); the
+  answer is the same static tool list for everyone and no Nextcloud call happens. Everything else
+  (``tools/call`` above all) still needs a login. A request that sends a header that is wrong is
+  refused, never downgraded to discovery. GET/DELETE without a login get 405 (no SSE stream).
 * Clients are cached per login (LRU, idle TTL). The cache key is an HMAC of login and password
   with a per-process random key, so neither the password nor a plain hash of it is kept as a key.
 * A request can lower, never raise, the server's permission level with the
@@ -25,6 +31,7 @@ import contextvars
 import dataclasses
 import hashlib
 import hmac
+import json
 import logging
 import secrets
 import time
@@ -45,6 +52,18 @@ PERMISSIONS_HEADER = "x-nextcloud-mcp-permissions"
 # A replaced or evicted client may still serve a tool call that started before; close it later.
 CLOSE_GRACE_SECONDS = 600.0
 _MAX_HEADER_BYTES = 4096
+# Upper bound for a discovery body read before the login check; real ones are a few hundred bytes.
+_MAX_DISCOVERY_BODY_BYTES = 64 * 1024
+# JSON-RPC methods that run without a login: protocol handshake and the static tool list.
+DISCOVERY_METHODS = frozenset(
+    {
+        "initialize",
+        "ping",
+        "tools/list",
+        "notifications/initialized",
+        "notifications/cancelled",
+    }
+)
 _AMBIGUOUS = "\x00ambiguous"
 
 
@@ -308,7 +327,7 @@ ASGIApp = Callable[[dict[str, Any], Callable[..., Awaitable[Any]], Callable[...,
 
 
 class MultiUserAuthMiddleware:
-    """ASGI middleware: no valid login, no MCP. Pins the login's client to the request."""
+    """ASGI middleware: no valid login, no MCP beyond discovery. Pins the login's client to the request."""
 
     def __init__(self, app: ASGIApp, pool: ClientPool, server_level: PermissionLevel) -> None:
         self.app = app
@@ -320,6 +339,9 @@ class MultiUserAuthMiddleware:
             await self.app(scope, receive, send)
             return
         headers = _headers(scope)
+        if "authorization" not in headers:
+            await self._without_login(scope, receive, send)
+            return
         creds = parse_basic_auth(headers.get("authorization"))
         if creds is None:
             await _reply(send, 401, "Authentication required: send 'Authorization: Basic <login:app-password>'.")
@@ -347,6 +369,63 @@ class MultiUserAuthMiddleware:
         finally:
             _binding.reset(token)
 
+    async def _without_login(
+        self, scope: dict[str, Any], receive: Callable[..., Any], send: Callable[..., Any]
+    ) -> None:
+        """No Authorization header: only discovery runs (see module docstring), without a client."""
+        method = scope.get("method")
+        if method != "POST":
+            await _reply(send, 405, "Method not allowed without a login.", allow=b"POST")
+            return
+        body = await _read_body(receive, _MAX_DISCOVERY_BODY_BYTES)
+        if body is None or not is_discovery_body(body):
+            await _reply(send, 401, "Authentication required: send 'Authorization: Basic <login:app-password>'.")
+            return
+        await self.app(scope, _replay(body, receive), send)
+
+
+def is_discovery_body(body: bytes) -> bool:
+    """True if ``body`` is a JSON-RPC message (or non-empty batch) whose methods are all discovery."""
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return False
+    messages = cast(list[Any], payload) if isinstance(payload, list) else [payload]
+    if not messages:
+        return False
+    return all(isinstance(m, dict) and cast(dict[str, Any], m).get("method") in DISCOVERY_METHODS for m in messages)
+
+
+async def _read_body(receive: Callable[..., Any], limit: int) -> bytes | None:
+    """Read the whole request body; None if it is larger than ``limit`` or the client went away."""
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        message = await receive()
+        if message.get("type") != "http.request":
+            return None
+        chunk = cast(bytes, message.get("body", b""))
+        size += len(chunk)
+        if size > limit:
+            return None
+        chunks.append(chunk)
+        if not message.get("more_body", False):
+            return b"".join(chunks)
+
+
+def _replay(body: bytes, receive: Callable[..., Any]) -> Callable[..., Awaitable[dict[str, Any]]]:
+    """A ``receive`` that hands the already read body to the app once, then waits on the real one."""
+    sent = False
+
+    async def replay() -> dict[str, Any]:
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return cast(dict[str, Any], await receive())
+
+    return replay
+
 
 def _headers(scope: dict[str, Any]) -> dict[str, str]:
     out: dict[str, str] = {}
@@ -361,10 +440,12 @@ def _headers(scope: dict[str, Any]) -> dict[str, str]:
     return out
 
 
-async def _reply(send: Callable[..., Any], status: int, message: str) -> None:
+async def _reply(send: Callable[..., Any], status: int, message: str, allow: bytes | None = None) -> None:
     body = ('{"error": "' + message.replace('"', "'") + '"}').encode("utf-8")
     headers = [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode("ascii"))]
     if status == 401:
         headers.append((b"www-authenticate", b'Basic realm="nc-mcp-server", charset="UTF-8"'))
+    if allow is not None:
+        headers.append((b"allow", allow))
     await send({"type": "http.response.start", "status": status, "headers": headers})
     await send({"type": "http.response.body", "body": body})

@@ -185,6 +185,11 @@ nc-mcp-server --transport http
 
 - Every HTTP request needs `Authorization: Basic base64(<login>:<app-password>)`. No header, a malformed one
   or a login Nextcloud rejects -> `401`; Nextcloud not reachable -> `502`. There is no fallback account.
+- Exception, discovery: a `POST` **without** `Authorization` header whose JSON-RPC messages are all
+  `initialize`, `ping`, `tools/list` or `notifications/initialized|cancelled` runs without a login. Clients
+  list tools before they know who asks; the answer is the static tool list and no Nextcloud call happens.
+  `tools/call` and everything else still need a login; a wrong header is never downgraded to discovery.
+  `GET`/`DELETE` without a login -> `405`.
 - The login may be the user ID or another login name (e.g. the e-mail address); the server asks Nextcloud
   once per login (`GET /ocs/v2.php/cloud/user`) for the user ID it needs for WebDAV paths.
 - Clients are cached per login (LRU, `NEXTCLOUD_MCP_MULTIUSER_CACHE_SIZE`, default 64; idle TTL

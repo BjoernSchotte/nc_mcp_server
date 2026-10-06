@@ -398,3 +398,103 @@ class TestMiddleware:
         assert len(seen["alice"]) == 1
         assert len(seen["bob"]) == 1
         assert seen["alice"] != seen["bob"]
+
+
+# --- Discovery without a login ------------------------------------------------------------------
+
+_MCP_HEADERS = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
+_INIT = {
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}},
+}
+
+
+def _payload(response: Any) -> Any:
+    for line in response.text.splitlines():
+        if line.startswith("data:"):
+            return json.loads(line[5:])
+    return response.json()
+
+
+@pytest.fixture
+def mu_app_lookup(monkeypatch: pytest.MonkeyPatch) -> Any:
+    config = mu_config()
+    mcp = create_server(config)
+    _add_probe_tools(mcp)
+    lookup = FakeLookup()
+    monkeypatch.setattr("nc_mcp_server.server.ClientPool", lambda cfg: ClientPool(cfg, lookup=lookup))  # pyright: ignore[reportUnknownLambdaType]
+    app = create_http_app(mcp, config)
+    with TestClient(app) as client:
+        yield client, lookup
+    state_module.set_state(None, Config())
+
+
+class TestDiscoveryWithoutLogin:
+    def test_initialize_and_tools_list_without_login(self, mu_app_lookup: Any) -> None:
+        client, lookup = mu_app_lookup
+        response = client.post("/mcp", json=_INIT, headers=_MCP_HEADERS)
+        assert response.status_code == 200
+        assert _payload(response)["result"]["serverInfo"]["name"] == "nc-mcp-server"
+        note = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        assert client.post("/mcp", json=note, headers=_MCP_HEADERS).status_code == 202
+        response = client.post("/mcp", json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"}, headers=_MCP_HEADERS)
+        assert response.status_code == 200
+        names = {t["name"] for t in _payload(response)["result"]["tools"]}
+        assert {"list_directory", "get_file", "probe_whoami"} <= names
+        ping = client.post("/mcp", json={"jsonrpc": "2.0", "id": 3, "method": "ping"}, headers=_MCP_HEADERS)
+        assert ping.status_code == 200
+        assert lookup.calls == []  # no Nextcloud call, no client
+
+    def test_tools_call_without_login_is_401(self, mu_app_lookup: Any) -> None:
+        client, lookup = mu_app_lookup
+        status, _ = _call(client, "probe_whoami", {})
+        assert status == 401
+        assert lookup.calls == []
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            [{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, {"jsonrpc": "2.0", "id": 2, "method": "tools/call"}],
+            [],
+            {"jsonrpc": "2.0", "id": 1, "method": "resources/read", "params": {"uri": "x"}},
+            {"jsonrpc": "2.0", "id": 1},
+            "tools/list",
+        ],
+    )
+    def test_other_bodies_without_login_are_401(self, mu_app_lookup: Any, body: Any) -> None:
+        client, _ = mu_app_lookup
+        response = client.post("/mcp", json=body, headers=_MCP_HEADERS)
+        assert response.status_code == 401
+
+    def test_invalid_json_without_login_is_401(self, mu_app_lookup: Any) -> None:
+        client, _ = mu_app_lookup
+        response = client.post("/mcp", content=b"{not json", headers=_MCP_HEADERS)
+        assert response.status_code == 401
+
+    def test_oversized_body_without_login_is_401(self, mu_app_lookup: Any) -> None:
+        client, _ = mu_app_lookup
+        body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"pad": "x" * 70_000}}
+        response = client.post("/mcp", json=body, headers=_MCP_HEADERS)
+        assert response.status_code == 401
+
+    def test_get_and_delete_without_login_are_405(self, mu_app_lookup: Any) -> None:
+        client, _ = mu_app_lookup
+        for method in ("GET", "DELETE"):
+            response = client.request(method, "/mcp", headers=_MCP_HEADERS)
+            assert response.status_code == 405
+            assert response.headers["allow"] == "POST"
+
+    @pytest.mark.parametrize("auth", ["", "Bearer xyz", "Basic !!!"])
+    def test_wrong_header_is_never_downgraded_to_discovery(self, mu_app_lookup: Any, auth: str) -> None:
+        client, _ = mu_app_lookup
+        body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        response = client.post("/mcp", json=body, headers={**_MCP_HEADERS, "Authorization": auth})
+        assert response.status_code == 401
+
+    def test_rejected_login_is_not_downgraded(self, mu_app_lookup: Any) -> None:
+        client, _ = mu_app_lookup
+        body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        response = client.post("/mcp", json=body, headers={**_MCP_HEADERS, "Authorization": basic("bad", "x")})
+        assert response.status_code == 401
