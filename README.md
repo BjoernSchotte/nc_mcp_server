@@ -170,6 +170,30 @@ nc-mcp-server --transport http
 # Listens on http://0.0.0.0:8100 by default
 ```
 
+### Multi-User Mode (HTTP only)
+
+One HTTP server can act for many Nextcloud accounts. Each request brings its own login; the server
+holds none.
+
+```bash
+export NEXTCLOUD_URL=https://your-nextcloud.example.com
+export NEXTCLOUD_MCP_MULTIUSER=true
+export NEXTCLOUD_MCP_PERMISSIONS=write   # the highest level any request may use
+# NEXTCLOUD_USER and NEXTCLOUD_PASSWORD must NOT be set
+nc-mcp-server --transport http
+```
+
+- Every HTTP request needs `Authorization: Basic base64(<login>:<app-password>)`. No header, a malformed one
+  or a login Nextcloud rejects -> `401`; Nextcloud not reachable -> `502`. There is no fallback account.
+- The login may be the user ID or another login name (e.g. the e-mail address); the server asks Nextcloud
+  once per login (`GET /ocs/v2.php/cloud/user`) for the user ID it needs for WebDAV paths.
+- Clients are cached per login (LRU, `NEXTCLOUD_MCP_MULTIUSER_CACHE_SIZE`, default 64; idle TTL
+  `NEXTCLOUD_MCP_MULTIUSER_TTL` seconds, default 900). Two logins never share a client.
+- A request can lower, never raise, the permission level: `X-Nextcloud-MCP-Permissions: read`
+  (e.g. for a read-only service account behind the same server).
+- The server trusts whoever can reach it with a valid app password; put it on a private network.
+  `NEXTCLOUD_MCP_UPLOAD_ROOT` is not available in this mode.
+
 ### Stdio Mode (default)
 
 ```bash
