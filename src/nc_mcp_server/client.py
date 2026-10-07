@@ -14,6 +14,7 @@ import niquests
 from urllib3.util import Retry, Timeout
 
 from .config import Config
+from .login_paths import PathNotAllowedError, check_request
 
 log = logging.getLogger(__name__)
 
@@ -396,8 +397,21 @@ class NextcloudClient:
             pass
         session.auth = saved_auth
 
+    def _check_login_paths(self, method: str, url: str, kwargs: dict[str, Any]) -> None:
+        """Restricted login (NEXTCLOUD_MCP_LOGIN_PATHS): refuse before anything is sent."""
+        prefixes = self._config.path_prefixes
+        if prefixes is None:
+            return
+        try:
+            check_request(
+                method, url, kwargs.get("headers"), base_url=self._base_url, dav_user=self._dav_user, prefixes=prefixes
+            )
+        except PathNotAllowedError as exc:
+            raise NextcloudError(str(exc), 403) from None
+
     async def _do_request(self, method: str, url: str, **kwargs: Any) -> niquests.Response:
         """Execute an HTTP request, retrying once if a cached session expired or lacks a password confirmation."""
+        self._check_login_paths(method, url, kwargs)
         session = await self._get_session()
         # Taken per request: a concurrent call can swap self._session while this one is in flight
         cached = session.auth is None
@@ -420,6 +434,7 @@ class NextcloudClient:
         'allowed_no_password_confirmation_ranges' apply, which Nextcloud skips for session logins.
         A login also sets up the user's files from scratch, which a session does not always do.
         """
+        self._check_login_paths(method, url, kwargs)
         log.debug("Sending %s %s with a fresh login", method, url)
         session = self._build_session()
         try:

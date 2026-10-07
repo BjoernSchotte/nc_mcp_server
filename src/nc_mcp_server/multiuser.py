@@ -218,6 +218,8 @@ class ClientPool:
                     login=creds.login,
                     password=creds.password,
                     is_app_password=True,
+                    # NEXTCLOUD_MCP_LOGIN_PATHS: limits by login, fixed with the client.
+                    path_prefixes=self._base.login_paths.get(creds.login),
                 )
                 entry = _Entry(client=NextcloudClient(config), config=config, last_used=self._clock())
             except BaseException as exc:

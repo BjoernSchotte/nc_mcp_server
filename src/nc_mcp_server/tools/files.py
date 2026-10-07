@@ -22,6 +22,7 @@ from ..annotations import (
     READONLY,
 )
 from ..client import NextcloudClient
+from ..login_paths import filter_results, scope_search
 from ..permissions import PermissionLevel, require_permission
 from ..state import get_client, get_config, get_server_config
 
@@ -246,6 +247,8 @@ def _register_read_tools(mcp: FastMCP) -> None:
         offset = max(0, offset)
         config = get_config()
         client = get_client()
+        # Restricted login (NEXTCLOUD_MCP_LOGIN_PATHS): scope inside its folders, results filtered.
+        path = scope_search(path, config.path_prefixes)
         body = _build_search_xml(config.user, query, path, limit, offset, mimetype)
         response = await client.dav_request(
             "SEARCH",
@@ -255,6 +258,7 @@ def _register_read_tools(mcp: FastMCP) -> None:
             context=f"Search files: query={query!r} mimetype={mimetype!r}",
         )
         results = NextcloudClient._parse_propfind(response.text or "", config.user)
+        results = filter_results(results, config.path_prefixes)
         response_data = {
             "data": results,
             "pagination": {
