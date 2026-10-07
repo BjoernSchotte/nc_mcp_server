@@ -136,6 +136,10 @@ class TestParse:
         with pytest.raises(ValueError, match="not valid JSON"):
             Config.from_env()
 
+    def test_case_duplicates_refused(self) -> None:
+        with pytest.raises(ValueError, match="listed twice"):
+            parse_login_paths('{"Bot": ["A"], "bot": ["B"]}')
+
     def test_needs_multiuser(self) -> None:
         with pytest.raises(ValueError, match="needs NEXTCLOUD_MCP_MULTIUSER"):
             Config(nextcloud_url=BASE, user="u", password="p", login_paths={"u": ("A",)}).validate()
@@ -347,6 +351,8 @@ class TestReviewFixes:
                 chk(bad)
         with pytest.raises(PathNotAllowedError):
             chk(SEARCH_BODY.format(scope="Allgemein").replace("itverband-claw-bot", "alice"))
+        with pytest.raises(PathNotAllowedError):
+            chk(SEARCH_BODY.format(scope="Allgemein/&#46;&#46;/Vorstand"))
 
     async def test_no_redirects_for_restricted(self) -> None:
         c = restricted_client()

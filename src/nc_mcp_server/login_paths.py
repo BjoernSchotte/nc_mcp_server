@@ -67,6 +67,8 @@ def parse_login_paths(raw: str) -> dict[str, tuple[str, ...]]:
                     f"NEXTCLOUD_MCP_LOGIN_PATHS[{login!r}]: invalid prefix {p!r} (no root, '.', '..', '%' or '\\')."
                 )
             clean.append(n)
+        if any(k.casefold() == login.casefold() for k in out):
+            raise ValueError(f"NEXTCLOUD_MCP_LOGIN_PATHS: {login!r} is listed twice (logins match case-insensitively).")
         out[login] = tuple(dict.fromkeys(clean))
     return out
 
@@ -137,6 +139,9 @@ def _check_search_scopes(body: object, user: str, prefixes: tuple[str, ...]) -> 
         raise PathNotAllowedError("Search scope not allowed for this login.")
     root = f"/files/{user}/"
     for h in hrefs:
+        # Numeric entities (&#46;&#46;) would decode to ".." in the server's XML parser.
+        if "&#" in h:
+            raise PathNotAllowedError("Search scope not allowed for this login.")
         literal = xml_unescape(h.strip(), {"&quot;": '"', "&apos;": "'"})
         if not literal.startswith(root):
             raise PathNotAllowedError("Search scope not allowed for this login.")
