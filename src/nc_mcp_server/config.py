@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .login_paths import parse_login_paths
 from .permissions import PermissionLevel
 
 
@@ -31,6 +32,9 @@ class Config:
             header; NEXTCLOUD_USER and NEXTCLOUD_PASSWORD must not be set. Requires --transport http.
         NEXTCLOUD_MCP_MULTIUSER_CACHE_SIZE: Clients kept for recent logins (default: 64).
         NEXTCLOUD_MCP_MULTIUSER_TTL: Seconds an unused login's client is kept (default: 900).
+        NEXTCLOUD_MCP_LOGIN_PATHS: JSON object {login: [folder prefixes]} (multi-user mode only).
+            A listed login may only reach WebDAV files below its prefixes; every other endpoint
+            is refused before Nextcloud is asked (see login_paths.py). Unset: no limits.
         NEXTCLOUD_MCP_TIMEZONE: IANA time zone (e.g. Europe/Berlin) for calendar times given without
             an offset. Events then carry a TZID and a VTIMEZONE. Unset: such times are UTC.
     """
@@ -52,6 +56,10 @@ class Config:
     login: str = field(default="")
     # IANA zone for calendar times without an offset; "" = UTC (see NEXTCLOUD_MCP_TIMEZONE).
     timezone: str = field(default="")
+    # Multi-user mode: login -> allowed folder prefixes (NEXTCLOUD_MCP_LOGIN_PATHS).
+    login_paths: dict[str, tuple[str, ...]] = field(default_factory=dict[str, tuple[str, ...]])
+    # Set per login in multi-user mode: the prefixes of this client's login, None = unrestricted.
+    path_prefixes: tuple[str, ...] | None = field(default=None)
 
     @property
     def auth_login(self) -> str:
@@ -84,6 +92,8 @@ class Config:
         multiuser = _env_bool("NEXTCLOUD_MCP_MULTIUSER")
         cache_size = _env_number("NEXTCLOUD_MCP_MULTIUSER_CACHE_SIZE", "64", int, minimum=1)
         ttl = _env_number("NEXTCLOUD_MCP_MULTIUSER_TTL", "900", float, minimum=1)
+
+        login_paths = parse_login_paths(os.environ.get("NEXTCLOUD_MCP_LOGIN_PATHS", ""))
 
         timezone = os.environ.get("NEXTCLOUD_MCP_TIMEZONE", "").strip()
         if timezone:
@@ -119,6 +129,7 @@ class Config:
             multiuser_cache_size=int(cache_size),
             multiuser_ttl=float(ttl),
             timezone=timezone,
+            login_paths=login_paths,
         )
 
     def validate(self) -> None:
@@ -141,6 +152,8 @@ class Config:
                     f"Set them before starting the MCP server."
                 )
             return
+        if self.login_paths:
+            raise ValueError("NEXTCLOUD_MCP_LOGIN_PATHS needs NEXTCLOUD_MCP_MULTIUSER=true.")
         if not self.user:
             missing.append("NEXTCLOUD_USER")
         if not self.password:

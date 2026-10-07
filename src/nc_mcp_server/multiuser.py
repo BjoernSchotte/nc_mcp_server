@@ -44,6 +44,7 @@ from mcp.server.lowlevel.server import request_ctx
 
 from .client import NextcloudClient
 from .config import Config
+from .login_paths import prefixes_for
 from .permissions import PermissionLevel, set_cap_provider
 
 log = logging.getLogger(__name__)
@@ -180,6 +181,9 @@ class ClientPool:
         self._base = base
         self._lookup = lookup
         self._clock = clock
+        for login, prefixes in base.login_paths.items():
+            # Visible at startup: a typo in a key would otherwise leave a login unrestricted.
+            log.info("Login %r (or user ID) restricted to: %s", login, ", ".join(prefixes))
         self._close_grace = close_grace
         self._key = secrets.token_bytes(32)
         self._entries: OrderedDict[str, _Entry] = OrderedDict()
@@ -218,6 +222,8 @@ class ClientPool:
                     login=creds.login,
                     password=creds.password,
                     is_app_password=True,
+                    # NEXTCLOUD_MCP_LOGIN_PATHS: limits by login, fixed with the client.
+                    path_prefixes=prefixes_for(self._base.login_paths, creds.login, user_id),
                 )
                 entry = _Entry(client=NextcloudClient(config), config=config, last_used=self._clock())
             except BaseException as exc:

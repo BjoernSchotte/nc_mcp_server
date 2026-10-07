@@ -14,6 +14,7 @@ import niquests
 from urllib3.util import Retry, Timeout
 
 from .config import Config
+from .login_paths import PathNotAllowedError, check_request
 
 log = logging.getLogger(__name__)
 
@@ -314,6 +315,9 @@ class NextcloudClient:
 
     async def _send(self, session: niquests.AsyncSession, method: str, url: str, **kwargs: Any) -> niquests.Response:
         """Send a request through a session, closing the session afterwards if it was replaced meanwhile."""
+        # Every session request passes here (streaming upload included): restricted logins are
+        # checked at this one place (NEXTCLOUD_MCP_LOGIN_PATHS).
+        self._check_login_paths(method, url, kwargs)
         key = id(session)
         self._in_flight[key] = self._in_flight.get(key, 0) + 1
         try:
@@ -396,6 +400,27 @@ class NextcloudClient:
             pass
         session.auth = saved_auth
 
+    def _check_login_paths(self, method: str, url: str, kwargs: dict[str, Any]) -> None:
+        """Restricted login (NEXTCLOUD_MCP_LOGIN_PATHS): refuse before anything is sent."""
+        prefixes = self._config.path_prefixes
+        if prefixes is None:
+            return
+        try:
+            check_request(
+                method,
+                url,
+                kwargs.get("headers"),
+                base_url=self._base_url,
+                dav_user=self._dav_user,
+                prefixes=prefixes,
+                user=self._config.user,
+                body=kwargs.get("data"),
+            )
+        except PathNotAllowedError as exc:
+            raise NextcloudError(str(exc), 403) from None
+        # A redirect would leave the checked URL: never follow one for a restricted login.
+        kwargs["allow_redirects"] = False
+
     async def _do_request(self, method: str, url: str, **kwargs: Any) -> niquests.Response:
         """Execute an HTTP request, retrying once if a cached session expired or lacks a password confirmation."""
         session = await self._get_session()
@@ -420,6 +445,7 @@ class NextcloudClient:
         'allowed_no_password_confirmation_ranges' apply, which Nextcloud skips for session logins.
         A login also sets up the user's files from scratch, which a session does not always do.
         """
+        self._check_login_paths(method, url, kwargs)
         log.debug("Sending %s %s with a fresh login", method, url)
         session = self._build_session()
         try:
