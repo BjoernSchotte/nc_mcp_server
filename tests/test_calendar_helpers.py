@@ -125,7 +125,7 @@ class TestBuildIcal:
     def test_zoned_event_has_tzid_vtimezone_and_creator(self) -> None:
         start = datetime(2026, 10, 20, 19, 0, tzinfo=BERLIN)
         end = datetime(2026, 10, 20, 21, 0, tzinfo=BERLIN)
-        text = _build_ical("u1", "Stammtisch", start, end, rrule="FREQ=MONTHLY;BYDAY=3TU", created_by="anna")
+        text = _build_ical("u1", "Meetup", start, end, rrule="FREQ=MONTHLY;BYDAY=3TU", created_by="anna")
         assert "DTSTART;TZID=Europe/Berlin:20261020T190000" in text
         assert "BEGIN:VTIMEZONE" in text
         assert f"{CREATED_BY_PROP}:anna" in text
@@ -167,7 +167,7 @@ class TestBuildIcal:
 class TestUpdates:
     def _event(self, **kw: object) -> ICal:
         start = datetime(2026, 10, 20, 19, 0, tzinfo=BERLIN)
-        return ICal.from_ical(_build_ical("u", "Stammtisch", start, start.replace(hour=21), **kw))  # type: ignore[arg-type]
+        return ICal.from_ical(_build_ical("u", "Meetup", start, start.replace(hour=21), **kw))  # type: ignore[arg-type]
 
     def test_new_start_keeps_event_zone(self) -> None:
         component = _vevent(self._event())
@@ -204,10 +204,10 @@ class TestUpdates:
 
     def test_check_summary(self) -> None:
         component = _vevent(self._event())
-        _check_summary(component, " stammtisch ", "u")
+        _check_summary(component, " meetup ", "u")
         _check_summary(component, "", "u")
         with pytest.raises(ValueError, match="Nothing was changed"):
-            _check_summary(component, "Vorstandssitzung", "u")
+            _check_summary(component, "Board meeting", "u")
 
 
 class TestUrl:
@@ -226,7 +226,7 @@ class TestCalendarAdminHelpers:
         assert _slug("!!!") == "calendar"
 
     def test_principal_and_share_body(self) -> None:
-        assert _principal(" Vorstand ", "group") == "principals/groups/Vorstand"
+        assert _principal(" Board ", "group") == "principals/groups/Board"
         assert _principal("anna", "USER") == "principals/users/anna"
         with pytest.raises(ValueError, match="share_type"):
             _principal("anna", "email")

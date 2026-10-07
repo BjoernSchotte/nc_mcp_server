@@ -1030,7 +1030,7 @@ def _register_calendar_admin(mcp: FastMCP) -> None:
         """Create a new calendar (events only) for the current user, optionally shared with a group.
 
         Args:
-            name: Display name, e.g. "Sommerfest 2027".
+            name: Display name, e.g. "Summer party 2027".
             color: Optional color as #RRGGBB.
             share_with_group: Optional Nextcloud group ID to share the new calendar with right away.
             group_write: Whether that group may also add and change events (default: read only).

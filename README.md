@@ -30,9 +30,9 @@ export NEXTCLOUD_PASSWORD=your-app-password
 nc-mcp-server
 ```
 
-## 224 Tools Across 24 Nextcloud Apps
+## 231 Tools Across 24 Nextcloud Apps
 
-A 225th tool, `upload_file_from_path`, is registered only when the operator sets
+A 232nd tool, `upload_file_from_path`, is registered only when the operator sets
 `NEXTCLOUD_MCP_UPLOAD_ROOT`. See [Files](#files) for details.
 
 | Category | Tools | Protocol |
@@ -52,7 +52,7 @@ A 225th tool, `upload_file_from_path`, is registered only when the operator sets
 | [Talk](#talk) | conversations, messages, threads, participants, edits, reactions, read state, shared items, pins, reminders, personal settings and tags, participant and conversation management | OCS |
 | [Talk Polls](#talk-polls) | get, create, vote, close polls | OCS |
 | [Announcements](#announcements) | list, create, delete announcements | OCS |
-| [Calendar](#calendar) | list calendars, CRUD events | CalDAV |
+| [Calendar](#calendar) | list, create, share, publish and delete calendars; CRUD events with time zones and recurrence checks | CalDAV |
 | [Contacts](#contacts) | list address books, CRUD contacts | CardDAV |
 | [Tasks](#tasks) | list lists, CRUD tasks, complete | CalDAV |
 | [Mail](#mail) | accounts, mailboxes, messages, send, move, flags, tags | OCS + REST |

@@ -31,7 +31,7 @@ async def member_and_group() -> AsyncGenerator[tuple[Config, Config, str]]:
     admin = NextcloudClient(admin_config)
     suffix = secrets.token_hex(4)
     group = f"mcp-grp-{suffix}"
-    user_id = f"kal-mitglied-{suffix}"
+    user_id = f"mcp-member-{suffix}"
     password = f"Mcp-{secrets.token_hex(10)}-x"
     try:
         await admin.ocs_post("cloud/groups", data={"groupid": group})

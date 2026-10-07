@@ -162,15 +162,15 @@ class TestGuard:
 
 
 @pytest.fixture
-async def shared_calendar() -> AsyncGenerator[tuple[Config, Config, str, str]]:
+async def shared_calendar() -> AsyncGenerator[tuple[Config, Config, Config, str]]:
     """admin owns a calendar shared read-write with a new member account and read-only with another."""
     admin_config = _get_integration_config()
     admin = NextcloudClient(admin_config)
     suffix = secrets.token_hex(4)
-    uri = f"mcp-test-verein-{suffix}"
+    uri = f"mcp-test-shared-{suffix}"
     members: list[Config] = []
     try:
-        for name in ("kal-anna", "kal-leser"):
+        for name in ("mcp-writer", "mcp-reader"):
             user_id = f"{name}-{suffix}"
             password = f"Mcp-{secrets.token_hex(10)}!"
             await admin.ocs_post("cloud/users", data={"userid": user_id, "password": password})
@@ -187,7 +187,7 @@ async def shared_calendar() -> AsyncGenerator[tuple[Config, Config, str, str]]:
             f"calendars/{admin_config.user}/{uri}",
             body=(
                 '<?xml version="1.0"?><c:mkcalendar xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">'
-                "<d:set><d:prop><d:displayname>Vereinstermine Test</d:displayname></d:prop></d:set></c:mkcalendar>"
+                "<d:set><d:prop><d:displayname>Shared events test</d:displayname></d:prop></d:set></c:mkcalendar>"
             ),
             headers={"Content-Type": "application/xml; charset=utf-8"},
         )
@@ -214,12 +214,12 @@ async def shared_calendar() -> AsyncGenerator[tuple[Config, Config, str, str]]:
 class TestSharedCalendar:
     @pytest.mark.asyncio
     async def test_member_writes_owner_needs_allow_foreign(
-        self, shared_calendar: tuple[Config, Config, str, str]
+        self, shared_calendar: tuple[Config, Config, Config, str]
     ) -> None:
-        admin_config, anna, leser, uri = shared_calendar
+        admin_config, writer_config, reader_config, uri = shared_calendar
         shared_id = f"{uri}_shared_by_{admin_config.user}"
 
-        member = _server(anna)
+        member = _server(writer_config)
         try:
             calendars = {c["id"]: c for c in json.loads(await member.call("list_calendars"))}
             assert shared_id in calendars
@@ -228,12 +228,12 @@ class TestSharedCalendar:
                 await member.call(
                     "create_event",
                     calendar_id=shared_id,
-                    summary="mcp-test-stammtisch",
+                    summary="mcp-test-meetup",
                     start="2027-05-04T19:00:00",
                     timezone="Europe/Berlin",
                 )
             )
-            await member.call("update_event", calendar_id=shared_id, event_uid=created["uid"], description="Neu")
+            await member.call("update_event", calendar_id=shared_id, event_uid=created["uid"], description="New")
         finally:
             await member.client.close()
 
@@ -246,7 +246,7 @@ class TestSharedCalendar:
         finally:
             await owner.client.close()
 
-        reader = _server(leser)
+        reader = _server(reader_config)
         try:
             calendars = {c["id"]: c for c in json.loads(await reader.call("list_calendars"))}
             assert calendars[shared_id]["writable"] is False
