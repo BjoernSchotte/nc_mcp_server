@@ -6,6 +6,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from typing import Any
+from urllib.parse import unquote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from xml.sax.saxutils import escape as xml_escape
 
@@ -915,9 +916,324 @@ def _register_destructive_tools(mcp: FastMCP) -> None:
         return f"Event '{event_uid}' deleted."
 
 
+CAL_ID_RE = re.compile(r"^[A-Za-z0-9_@-][A-Za-z0-9_.@' -]{0,199}$")
+SHARE_TYPES = {"user": "users", "group": "groups"}
+SHARE_WITH_RE = re.compile(r"^[A-Za-z0-9_.@' -]{1,64}$")
+
+
+def _check_calendar_id(calendar_id: str) -> str:
+    if not CAL_ID_RE.match(calendar_id) or ".." in calendar_id or calendar_id in SKIP_CALENDARS:
+        raise ValueError(f"Invalid calendar_id '{calendar_id}'.")
+    return calendar_id
+
+
+def _slug(name: str) -> str:
+    """URI for a new calendar, like Nextcloud Calendar derives it from the name."""
+    table = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss", "Ä": "ae", "Ö": "oe", "Ü": "ue"})
+    slug = re.sub(r"[^a-z0-9]+", "-", name.translate(table).lower()).strip("-")
+    return (slug or "calendar")[:60]
+
+
+def _share_body(principal: str, write: bool | None) -> str:
+    if write is None:
+        inner = f"<o:remove><d:href>principal:{xml_escape(principal)}</d:href></o:remove>"
+    else:
+        access = "<o:read-write/>" if write else ""
+        inner = f"<o:set><d:href>principal:{xml_escape(principal)}</d:href>{access}</o:set>"
+    return f'<?xml version="1.0" encoding="UTF-8"?><o:share xmlns:d="DAV:" xmlns:o="http://owncloud.org/ns">{inner}</o:share>'
+
+
+def _principal(share_with: str, share_type: str) -> str:
+    kind = SHARE_TYPES.get(share_type.strip().lower())
+    if kind is None:
+        raise ValueError("share_type must be 'user' or 'group'.")
+    if not SHARE_WITH_RE.match(share_with.strip()):
+        raise ValueError(f"Invalid share_with '{share_with}'.")
+    return f"principals/{kind}/{share_with.strip()}"
+
+
+SHARES_PROPFIND = (
+    '<?xml version="1.0" encoding="UTF-8"?><d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns"'
+    ' xmlns:cs="http://calendarserver.org/ns/"><d:prop><d:displayname/><oc:owner-principal/><oc:invite/>'
+    "<cs:publish-url/></d:prop></d:propfind>"
+)
+OC_NS = "http://owncloud.org/ns"
+
+
+async def _calendar_info(calendar_id: str) -> dict[str, Any]:
+    """Name, owner, shares and public URL of one calendar (shares only visible to the owner)."""
+    client = get_client()
+    user = get_config().user
+    # Depth 1 on the calendar home: Nextcloud returns owner-principal only there, not with
+    # Depth 0 on the calendar itself (seen on Nextcloud 34).
+    response = await client.dav_request(
+        "PROPFIND",
+        _caldav_path(user),
+        body=SHARES_PROPFIND,
+        headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
+        context=f"Calendar '{calendar_id}'",
+    )
+    root = ET.fromstring(response.text or "")  # noqa: S314
+    prop = None
+    for resp in root.findall(f"{{{DAV_NS}}}response"):
+        href = resp.find(f"{{{DAV_NS}}}href")
+        if href is None or not href.text or unquote(href.text.rstrip("/").rsplit("/", 1)[-1]) != calendar_id:
+            continue
+        prop = find_ok_prop(resp)
+        break
+    if prop is None:
+        raise NextcloudError(f"Calendar '{calendar_id}' not found", 404)
+    owner = (_el_text(prop, OC_NS, "owner-principal") or "").rsplit("/", 1)[-1]
+    shares = []
+    invite = prop.find(f"{{{OC_NS}}}invite")
+    if invite is not None:
+        for entry in invite.findall(f"{{{OC_NS}}}user"):
+            href = entry.find(f"{{{DAV_NS}}}href")
+            principal = (href.text or "").removeprefix("principal:") if href is not None else ""
+            kind, _, name = principal.removeprefix("principals/").partition("/")
+            write = entry.find(f"{{{OC_NS}}}access/{{{OC_NS}}}read-write") is not None
+            shares.append({"type": "group" if kind == "groups" else "user", "share_with": name, "write": write})
+    publish = prop.find(f"{{{CS_NS}}}publish-url")
+    public_url = None
+    if publish is not None:
+        href = publish.find(f"{{{DAV_NS}}}href")
+        public_url = href.text if href is not None and href.text else None
+    return {
+        "id": calendar_id,
+        "name": _el_text(prop, DAV_NS, "displayname") or calendar_id,
+        "owner": owner,
+        "owned_by_me": owner == user,
+        "shares": shares if owner == user else None,
+        "public_url": public_url,
+    }
+
+
+def _register_calendar_admin(mcp: FastMCP) -> None:
+    @mcp.tool(annotations=READONLY)
+    @require_permission(PermissionLevel.READ)
+    async def get_calendar_shares(calendar_id: str) -> str:
+        """Who a calendar is shared with and whether it has a public link.
+
+        Shares are only visible to the calendar's owner (null for everyone else).
+
+        Args:
+            calendar_id: Calendar identifier from list_calendars.
+
+        Returns:
+            JSON with id, name, owner, owned_by_me, shares ([{type, share_with, write}] or null), public_url.
+        """
+        return json.dumps(await _calendar_info(_check_calendar_id(calendar_id)))
+
+    @mcp.tool(annotations=ADDITIVE)
+    @require_permission(PermissionLevel.WRITE)
+    async def create_calendar(name: str, color: str = "", share_with_group: str = "", group_write: bool = False) -> str:
+        """Create a new calendar (events only) for the current user, optionally shared with a group.
+
+        Args:
+            name: Display name, e.g. "Sommerfest 2027".
+            color: Optional color as #RRGGBB.
+            share_with_group: Optional Nextcloud group ID to share the new calendar with right away.
+            group_write: Whether that group may also add and change events (default: read only).
+
+        Returns:
+            JSON with id (use it as calendar_id), name and, when shared, the share.
+        """
+        name = name.strip()
+        if not name or len(name) > 100 or any(ord(c) < 32 for c in name):
+            raise ValueError("Calendar name must be 1-100 characters without control characters.")
+        if color and not re.fullmatch(r"#[0-9A-Fa-f]{6}", color):
+            raise ValueError("color must look like #1E78C1.")
+        principal = _principal(share_with_group, "group") if share_with_group else ""
+        client = get_client()
+        user = get_config().user
+        existing = {
+            c["id"]
+            for c in _parse_calendars_xml(
+                (
+                    await client.dav_request(
+                        "PROPFIND",
+                        _caldav_path(user),
+                        body=CALENDAR_PROPFIND,
+                        headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
+                        context="List calendars",
+                    )
+                ).text
+                or "",
+                user,
+            )
+        }
+        base = _slug(name)
+        uri = base
+        n = 2
+        while uri in existing or uri in SKIP_CALENDARS:
+            uri = f"{base}-{n}"
+            n += 1
+        color_prop = f"<x:calendar-color>{color}</x:calendar-color>" if color else ""
+        body = (
+            '<?xml version="1.0" encoding="UTF-8"?><c:mkcalendar xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"'
+            ' xmlns:x="http://apple.com/ns/ical/"><d:set><d:prop>'
+            f"<d:displayname>{xml_escape(name)}</d:displayname>{color_prop}"
+            '<c:supported-calendar-component-set><c:comp name="VEVENT"/></c:supported-calendar-component-set>'
+            "</d:prop></d:set></c:mkcalendar>"
+        )
+        # 405: the URI is taken, e.g. by a deleted calendar still in the trash bin -> next suffix.
+        for _attempt in range(10):
+            try:
+                await client.dav_request(
+                    "MKCALENDAR",
+                    _caldav_path(user, uri),
+                    body=body,
+                    headers={"Content-Type": "application/xml; charset=utf-8"},
+                    context=f"Create calendar '{name}'",
+                )
+                break
+            except NextcloudError as err:
+                if err.status_code != 405:
+                    raise
+                uri = f"{base}-{n}"
+                n += 1
+        else:
+            raise NextcloudError(f"No free URI for calendar '{name}'", 409)
+        result: dict[str, Any] = {"id": uri, "name": name}
+        if principal:
+            await client.dav_request(
+                "POST",
+                _caldav_path(user, uri),
+                body=_share_body(principal, group_write),
+                headers={"Content-Type": "application/xml; charset=utf-8"},
+                context=f"Share calendar '{uri}'",
+            )
+            result["share"] = {"type": "group", "share_with": share_with_group.strip(), "write": group_write}
+        return json.dumps(result)
+
+
+def _register_calendar_sharing(mcp: FastMCP) -> None:
+    @mcp.tool(annotations=ADDITIVE_IDEMPOTENT)
+    @require_permission(PermissionLevel.WRITE)
+    async def share_calendar(calendar_id: str, share_with: str, share_type: str = "user", write: bool = False) -> str:
+        """Share one of your calendars with a user or group of this Nextcloud, or change their rights.
+
+        Args:
+            calendar_id: Your calendar's identifier (only the owner can share).
+            share_with: User ID or group ID.
+            share_type: "user" or "group".
+            write: Whether they may add and change events (default: read only).
+
+        Returns:
+            Confirmation message.
+        """
+        principal = _principal(share_with, share_type)
+        await get_client().dav_request(
+            "POST",
+            _caldav_path(get_config().user, _check_calendar_id(calendar_id)),
+            body=_share_body(principal, write),
+            headers={"Content-Type": "application/xml; charset=utf-8"},
+            context=f"Share calendar '{calendar_id}'",
+        )
+        rights = "read-write" if write else "read"
+        return f"Calendar '{calendar_id}' shared with {share_type} '{share_with.strip()}' ({rights})."
+
+    @mcp.tool(annotations=DESTRUCTIVE)
+    @require_permission(PermissionLevel.WRITE)
+    async def unshare_calendar(calendar_id: str, share_with: str, share_type: str = "user") -> str:
+        """Stop sharing one of your calendars with a user or group.
+
+        Args:
+            calendar_id: Your calendar's identifier.
+            share_with: User ID or group ID.
+            share_type: "user" or "group".
+
+        Returns:
+            Confirmation message.
+        """
+        principal = _principal(share_with, share_type)
+        await get_client().dav_request(
+            "POST",
+            _caldav_path(get_config().user, _check_calendar_id(calendar_id)),
+            body=_share_body(principal, None),
+            headers={"Content-Type": "application/xml; charset=utf-8"},
+            context=f"Unshare calendar '{calendar_id}'",
+        )
+        return f"Calendar '{calendar_id}' no longer shared with {share_type} '{share_with.strip()}'."
+
+    @mcp.tool(annotations=ADDITIVE_IDEMPOTENT)
+    @require_permission(PermissionLevel.WRITE)
+    async def publish_calendar(calendar_id: str) -> str:
+        """Create a public read-only link for one of your calendars (anyone with the link can read it).
+
+        Args:
+            calendar_id: Your calendar's identifier.
+
+        Returns:
+            JSON with id and public_url.
+        """
+        calendar_id = _check_calendar_id(calendar_id)
+        await get_client().dav_request(
+            "POST",
+            _caldav_path(get_config().user, calendar_id),
+            body='<?xml version="1.0" encoding="UTF-8"?><cs:publish-calendar xmlns:cs="http://calendarserver.org/ns/"/>',
+            headers={"Content-Type": "application/xml; charset=utf-8"},
+            context=f"Publish calendar '{calendar_id}'",
+        )
+        info = await _calendar_info(calendar_id)
+        return json.dumps({"id": calendar_id, "public_url": info["public_url"]})
+
+    @mcp.tool(annotations=DESTRUCTIVE)
+    @require_permission(PermissionLevel.WRITE)
+    async def unpublish_calendar(calendar_id: str) -> str:
+        """Remove the public link of one of your calendars.
+
+        Args:
+            calendar_id: Your calendar's identifier.
+
+        Returns:
+            Confirmation message.
+        """
+        calendar_id = _check_calendar_id(calendar_id)
+        await get_client().dav_request(
+            "POST",
+            _caldav_path(get_config().user, calendar_id),
+            body='<?xml version="1.0" encoding="UTF-8"?><cs:unpublish-calendar xmlns:cs="http://calendarserver.org/ns/"/>',
+            headers={"Content-Type": "application/xml; charset=utf-8"},
+            context=f"Unpublish calendar '{calendar_id}'",
+        )
+        return f"Public link of calendar '{calendar_id}' removed."
+
+    @mcp.tool(annotations=DESTRUCTIVE)
+    @require_permission(PermissionLevel.DESTRUCTIVE)
+    async def delete_calendar(calendar_id: str, expected_name: str = "") -> str:
+        """Delete one of your calendars with all its events (Nextcloud keeps it in the trash bin
+        for a while). For a calendar shared with you, this removes it from your account only.
+
+        Args:
+            calendar_id: Calendar identifier.
+            expected_name: Optional current display name; nothing is deleted if it differs.
+
+        Returns:
+            Confirmation message.
+        """
+        calendar_id = _check_calendar_id(calendar_id)
+        if expected_name:
+            info = await _calendar_info(calendar_id)
+            names = {
+                info["name"].strip().casefold(),
+                info["name"].removesuffix(f" ({info['owner']})").strip().casefold(),
+            }
+            if expected_name.strip().casefold() not in names:
+                raise ValueError(
+                    f"Calendar '{calendar_id}' is named '{info['name']}', not '{expected_name}'. Nothing was deleted."
+                )
+        await get_client().dav_request(
+            "DELETE", _caldav_path(get_config().user, calendar_id), context=f"Delete calendar '{calendar_id}'"
+        )
+        return f"Calendar '{calendar_id}' deleted."
+
+
 def register(mcp: FastMCP) -> None:
     """Register calendar tools with the MCP server."""
     _register_read_tools(mcp)
     _register_create_event(mcp)
     _register_update_event(mcp)
     _register_destructive_tools(mcp)
+    _register_calendar_admin(mcp)
+    _register_calendar_sharing(mcp)

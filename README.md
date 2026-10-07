@@ -418,6 +418,13 @@ instead of the placeholders Talk stores (`{mention-user1}`, `{file}`).
 | `create_event` | write | Create a calendar event (time zone, checked RRULE, video link) |
 | `update_event` | write | Update an event (partial updates supported) |
 | `delete_event` | destructive | Delete a calendar event |
+| `get_calendar_shares` | read | Who a calendar is shared with, public link (owner only) |
+| `create_calendar` | write | Create a calendar, optionally shared with a group right away |
+| `share_calendar` | write | Share a calendar with a user/group or change their rights |
+| `unshare_calendar` | write | Stop sharing a calendar with a user/group |
+| `publish_calendar` | write | Create a public read-only link |
+| `unpublish_calendar` | write | Remove the public link |
+| `delete_calendar` | destructive | Delete a calendar (`expected_name` guard); for a sharee: remove it from their account |
 
 - Time zone: times without an offset are wall time in `timezone` (tool argument), else
   `NEXTCLOUD_MCP_TIMEZONE` (IANA name, e.g. `Europe/Berlin`), else UTC. Zoned events get a `TZID` and a
