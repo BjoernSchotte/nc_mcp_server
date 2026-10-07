@@ -10,10 +10,14 @@ from nc_mcp_server.tools.calendar import (
     CREATED_BY_PROP,
     _apply_event_updates,
     _build_ical,
+    _check_calendar_id,
     _check_summary,
     _format_event,
     _parse_dt,
     _parse_rrule,
+    _principal,
+    _share_body,
+    _slug,
     _to_caldav_utc,
     _validate_url,
     _vevent,
@@ -214,3 +218,26 @@ class TestUrl:
     def test_rejects(self, url: str) -> None:
         with pytest.raises(ValueError, match="conference_url"):
             _validate_url(url)
+
+
+class TestCalendarAdminHelpers:
+    def test_slug(self) -> None:
+        assert _slug("Sommerfest Ü 2027") == "sommerfest-ue-2027"
+        assert _slug("!!!") == "calendar"
+
+    def test_principal_and_share_body(self) -> None:
+        assert _principal(" Vorstand ", "group") == "principals/groups/Vorstand"
+        assert _principal("anna", "USER") == "principals/users/anna"
+        with pytest.raises(ValueError, match="share_type"):
+            _principal("anna", "email")
+        with pytest.raises(ValueError, match="share_with"):
+            _principal("a/b", "user")
+        assert "<o:read-write/>" in _share_body("principals/users/a", True)
+        assert "<o:read-write/>" not in _share_body("principals/users/a", False)
+        assert "<o:remove>" in _share_body("principals/users/a", None)
+
+    def test_calendar_id(self) -> None:
+        assert _check_calendar_id("it-verband_shared_by_bjoern.schotte") == "it-verband_shared_by_bjoern.schotte"
+        for bad in ("../x", "a/b", "inbox", "", "x" * 201):
+            with pytest.raises(ValueError, match="calendar_id"):
+                _check_calendar_id(bad)
