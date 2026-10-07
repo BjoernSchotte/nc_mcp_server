@@ -15,8 +15,10 @@ traversal). Prefix matching is by whole path segments: ``Shared`` does not match
 """
 
 import json
+import re
 import unicodedata
 from typing import cast
+from xml.sax.saxutils import unescape as xml_unescape
 from urllib.parse import unquote, urlsplit
 
 _FORBIDDEN_CHARS = frozenset("\\%")
@@ -89,7 +91,7 @@ def scope_search(path: str, prefixes: tuple[str, ...] | None) -> str:
     try:
         return check_path(path, prefixes)
     except PathNotAllowedError:
-        raise ValueError(f"Search path not allowed for this login. Allowed: {', '.join(prefixes)}") from None
+        raise ValueError("Search path not allowed for this login.") from None
 
 
 def filter_results(results: list[dict[str, object]], prefixes: tuple[str, ...] | None) -> list[dict[str, object]]:
@@ -99,8 +101,58 @@ def filter_results(results: list[dict[str, object]], prefixes: tuple[str, ...] |
     return [r for r in results if (n := normalize(str(r.get("path", "")))) and inside(n, prefixes)]
 
 
+def prefixes_for(login_paths: dict[str, tuple[str, ...]], login: str, user_id: str) -> tuple[str, ...] | None:
+    """Prefixes of an account: matched by login name or user ID, case-insensitively.
+
+    Nextcloud accepts a login name in any letter case and often the e-mail address; the user
+    ID is unique. Matching both closes the alias gap. Two entries for one account: the paths
+    allowed by both win (never the union).
+    """
+    if not login_paths:
+        return None
+    keys = {k.casefold(): v for k, v in login_paths.items()}
+    found = [keys[n.casefold()] for n in dict.fromkeys((login, user_id)) if n and n.casefold() in keys]
+    if not found:
+        return None
+    merged = found[0]
+    for other in found[1:]:
+        merged = tuple(dict.fromkeys([p for p in merged if inside(p, other)] + [p for p in other if inside(p, merged)]))
+    # Nothing in common: a prefix no real path can match (fail closed, never unrestricted).
+    return merged or ("\x00",)
+
+
+_HREF = re.compile(r"<(?:[A-Za-z0-9]+:)?href>(.*?)</(?:[A-Za-z0-9]+:)?href>", re.DOTALL)
+
+
+def _check_search_scopes(body: object, user: str, prefixes: tuple[str, ...]) -> None:
+    """Every scope href of a SEARCH body must be /files/<user>/<allowed path>."""
+    if isinstance(body, bytes):
+        text = body.decode("utf-8", "replace")
+    elif isinstance(body, str):
+        text = body
+    else:
+        text = ""
+    hrefs: list[str] = _HREF.findall(text)
+    if not hrefs or not user:
+        raise PathNotAllowedError("Search scope not allowed for this login.")
+    root = f"/files/{user}/"
+    for h in hrefs:
+        literal = xml_unescape(h.strip(), {"&quot;": '"', "&apos;": "'"})
+        if not literal.startswith(root):
+            raise PathNotAllowedError("Search scope not allowed for this login.")
+        check_path(literal[len(root) :], prefixes)
+
+
 def check_request(
-    method: str, url: str, headers: dict[str, str] | None, *, base_url: str, dav_user: str, prefixes: tuple[str, ...]
+    method: str,
+    url: str,
+    headers: dict[str, str] | None,
+    *,
+    base_url: str,
+    dav_user: str,
+    prefixes: tuple[str, ...],
+    user: str = "",
+    body: object = None,
 ) -> None:
     """Allow a request of a restricted login, or raise PathNotAllowedError."""
     base_path = urlsplit(base_url).path.rstrip("/")
@@ -111,7 +163,8 @@ def check_request(
         parts = urlsplit(target)
         if parts.query or parts.fragment:
             raise PathNotAllowedError("Path not allowed for this login.")
-        if urlsplit(base_url).netloc and parts.netloc and parts.netloc != urlsplit(base_url).netloc:
+        base = urlsplit(base_url)
+        if parts.netloc and (parts.scheme, parts.netloc) != (base.scheme, base.netloc):
             raise PathNotAllowedError("Path not allowed for this login.")
         raw = parts.path
         if not raw.startswith(files_root):
@@ -126,6 +179,7 @@ def check_request(
     if m == "SEARCH":
         if urlsplit(url).path not in (dav_root, dav_root.rstrip("/")):
             raise PathNotAllowedError("Path not allowed for this login.")
+        _check_search_scopes(body, user, prefixes)
         return
     if m not in ("PROPFIND", "GET", "HEAD", "PUT", "MKCOL", "COPY", "MOVE", "DELETE"):
         raise PathNotAllowedError("Only files below the allowed folders are available for this login.")

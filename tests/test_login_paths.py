@@ -5,6 +5,7 @@ before a request is sent. Other logins are unaffected; without the variable noth
 """
 
 import json
+from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -22,6 +23,7 @@ from nc_mcp_server.login_paths import (
     inside,
     normalize,
     parse_login_paths,
+    prefixes_for,
 )
 from nc_mcp_server.multiuser import Binding, ClientPool, Credentials, bind
 from nc_mcp_server.permissions import PermissionLevel
@@ -45,9 +47,11 @@ def ok_response(status: int = 207, text: str = "") -> niquests.Response:
 
 
 def mock_send(client: NextcloudClient, status: int = 207, text: str = "") -> AsyncMock:
-    send = AsyncMock(return_value=ok_response(status, text))
-    client._send = send  # type: ignore[method-assign]
-    return send
+    """Session below the client: the returned mock is what would reach Nextcloud."""
+    session = AsyncMock()
+    session.request = AsyncMock(return_value=ok_response(status, text))
+    client._get_session = AsyncMock(return_value=session)  # type: ignore[method-assign]
+    return session.request
 
 
 class TestNormalize:
@@ -147,7 +151,6 @@ class TestCheckRequest:
         self.check("PROPFIND", f"{self.files}/Allgemein/")
         self.check("GET", f"{self.files}/Allgemein/Satzung/Satzung%202025.pdf")
         self.check("COPY", f"{self.files}/Allgemein/a", {"Destination": f"{self.files}/Allgemein/b"})
-        self.check("SEARCH", f"{BASE}/remote.php/dav/")
 
     @pytest.mark.parametrize(
         ("method", "url", "headers"),
@@ -295,3 +298,102 @@ class TestSearchTool:
         assert send.await_args is not None
         body = send.await_args.kwargs["data"]
         assert "/files/itverband-claw-bot/Allgemein" in body
+
+
+SEARCH_BODY = (
+    '<?xml version="1.0"?><d:searchrequest xmlns:d="DAV:"><d:basicsearch><d:from><d:scope>'
+    "<d:href>/files/itverband-claw-bot/{scope}</d:href><d:depth>infinity</d:depth></d:scope></d:from>"
+    "</d:basicsearch></d:searchrequest>"
+)
+
+
+class TestReviewFixes:
+    async def test_streaming_upload_checked(self) -> None:
+        c = restricted_client()
+        session = AsyncMock()
+        with patch.object(NextcloudClient, "_get_session", AsyncMock(return_value=session)):
+
+            async def chunks() -> AsyncIterator[bytes]:
+                yield b"x"
+
+            with pytest.raises(NextcloudError) as err:
+                await c.dav_put_stream("Vorstand/evil.txt", chunks)
+            assert err.value.status_code == 403
+        session.request.assert_not_awaited()
+
+    def test_search_scope_from_body(self) -> None:
+        def chk(body: object) -> None:
+            check_request(
+                "SEARCH",
+                f"{BASE}/remote.php/dav/",
+                None,
+                base_url=BASE,
+                dav_user="itverband-claw-bot",
+                prefixes=PREFIXES,
+                user="itverband-claw-bot",
+                body=body,
+            )
+
+        chk(SEARCH_BODY.format(scope="Allgemein"))
+        chk(SEARCH_BODY.format(scope="Allgemein/Satzung").encode())
+        for bad in [
+            SEARCH_BODY.format(scope=""),
+            SEARCH_BODY.format(scope="Vorstand"),
+            SEARCH_BODY.format(scope="Allgemein/../Vorstand"),
+            "<x/>",
+            None,
+        ]:
+            with pytest.raises(PathNotAllowedError):
+                chk(bad)
+        with pytest.raises(PathNotAllowedError):
+            chk(SEARCH_BODY.format(scope="Allgemein").replace("itverband-claw-bot", "alice"))
+
+    async def test_no_redirects_for_restricted(self) -> None:
+        c = restricted_client()
+        session = AsyncMock()
+        session.request = AsyncMock(return_value=ok_response(200, "x"))
+        with patch.object(NextcloudClient, "_get_session", AsyncMock(return_value=session)):
+            await c.dav_get("Allgemein/x.md")
+        assert session.request.await_args is not None
+        assert session.request.await_args.kwargs["allow_redirects"] is False
+
+    def test_scheme_compared(self) -> None:
+        with pytest.raises(PathNotAllowedError):
+            check_request(
+                "GET",
+                "https://nc.invalid/remote.php/dav/files/itverband-claw-bot/Allgemein/x",
+                None,
+                base_url=BASE,
+                dav_user="itverband-claw-bot",
+                prefixes=PREFIXES,
+            )
+
+    def test_prefixes_by_login_or_user_id_case_insensitive(self) -> None:
+        lp = {"itverband-claw-bot": ("Allgemein",)}
+        assert prefixes_for(lp, "itverband-claw-bot", "itverband-claw-bot") == ("Allgemein",)
+        assert prefixes_for(lp, "Itverband-Claw-Bot", "itverband-claw-bot") == ("Allgemein",), "other case"
+        assert prefixes_for(lp, "bot@example.org", "itverband-claw-bot") == ("Allgemein",), "e-mail login, same user ID"
+        assert prefixes_for(lp, "alice", "alice") is None
+        assert prefixes_for({}, "x", "y") is None
+        both = {"bot@example.org": ("Allgemein/Satzung",), "itverband-claw-bot": ("Allgemein",)}
+        assert prefixes_for(both, "bot@example.org", "itverband-claw-bot") == ("Allgemein/Satzung",), "stricter wins"
+        disjoint = {"a": ("X",), "b": ("Y",)}
+        p = prefixes_for(disjoint, "a", "b")
+        assert p is not None
+        assert not inside("X/1", p)
+        assert not inside("Y/1", p)
+
+    async def test_pool_uses_user_id(self) -> None:
+        async def lookup(base: Config, creds: Credentials) -> str:
+            return "itverband-claw-bot"
+
+        cfg = Config(
+            nextcloud_url=BASE,
+            multiuser=True,
+            permission_level=PermissionLevel.READ,
+            login_paths={"itverband-claw-bot": ("Allgemein",)},
+        )
+        pool = ClientPool(cfg, lookup=lookup)
+        _, c = await pool.get(Credentials("ITVERBAND-CLAW-BOT", "pw"))
+        assert c.path_prefixes == ("Allgemein",)
+        await pool.close()
