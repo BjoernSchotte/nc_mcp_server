@@ -30,9 +30,9 @@ export NEXTCLOUD_PASSWORD=your-app-password
 nc-mcp-server
 ```
 
-## 222 Tools Across 24 Nextcloud Apps
+## 224 Tools Across 24 Nextcloud Apps
 
-A 223rd tool, `upload_file_from_path`, is registered only when the operator sets
+A 225th tool, `upload_file_from_path`, is registered only when the operator sets
 `NEXTCLOUD_MCP_UPLOAD_ROOT`. See [Files](#files) for details.
 
 | Category | Tools | Protocol |
@@ -314,7 +314,7 @@ level, as does disabling an account with `set_user_enabled`.
 | Tool | Permission | Description |
 |------|-----------|-------------|
 | `list_conversations` | read | List all Talk conversations |
-| `get_conversation` | read | Get conversation details |
+| `get_conversation` | read | Get conversation details, with the link to join it |
 | `get_messages` | read | Get messages from a conversation, or from one thread |
 | `get_participants` | read | List participants in a conversation |
 | `list_threads` | read | List the most recently active threads in a conversation |
@@ -328,7 +328,9 @@ level, as does disabling an account with `set_user_enabled`.
 | `list_conversation_tags` | read | List your personal conversation tags |
 | `list_conversation_presets` | read | List the presets create_conversation can start from |
 | `send_message` | write | Send a message; can start a thread or post into one |
-| `create_conversation` | write | Create a one-to-one, group or public conversation, optionally from a preset |
+| `create_conversation` | write | Create a one-to-one, group or public conversation, optionally from a preset; returns the link to join it |
+| `set_conversation_password` | write | Set the password guests need for a public conversation (moderators); removing it needs `destructive` |
+| `set_conversation_lobby` | write | Turn the lobby on, optionally until a time, or off (moderators) |
 | `update_conversation` | write | Rename, describe, lock (read-only) or open (public) a conversation (moderators); making it private needs `destructive`; owners can preserve it (Talk 25+) |
 | `add_participant` | write | Add a user, group, team, email guest or federated user (moderators) |
 | `set_participant_role` | write | Make a participant owner (Talk 25+), moderator or user |
