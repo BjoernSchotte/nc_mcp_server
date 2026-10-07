@@ -3,6 +3,7 @@
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .permissions import PermissionLevel
 
@@ -30,6 +31,8 @@ class Config:
             header; NEXTCLOUD_USER and NEXTCLOUD_PASSWORD must not be set. Requires --transport http.
         NEXTCLOUD_MCP_MULTIUSER_CACHE_SIZE: Clients kept for recent logins (default: 64).
         NEXTCLOUD_MCP_MULTIUSER_TTL: Seconds an unused login's client is kept (default: 900).
+        NEXTCLOUD_MCP_TIMEZONE: IANA time zone (e.g. Europe/Berlin) for calendar times given without
+            an offset. Events then carry a TZID and a VTIMEZONE. Unset: such times are UTC.
     """
 
     nextcloud_url: str = field(default="")
@@ -47,6 +50,8 @@ class Config:
     # Login name for Basic Auth when it differs from the user ID (e.g. a login by e-mail address).
     # Empty means the user ID. Set per login in multi-user mode; the user ID builds DAV paths.
     login: str = field(default="")
+    # IANA zone for calendar times without an offset; "" = UTC (see NEXTCLOUD_MCP_TIMEZONE).
+    timezone: str = field(default="")
 
     @property
     def auth_login(self) -> str:
@@ -80,6 +85,15 @@ class Config:
         cache_size = _env_number("NEXTCLOUD_MCP_MULTIUSER_CACHE_SIZE", "64", int, minimum=1)
         ttl = _env_number("NEXTCLOUD_MCP_MULTIUSER_TTL", "900", float, minimum=1)
 
+        timezone = os.environ.get("NEXTCLOUD_MCP_TIMEZONE", "").strip()
+        if timezone:
+            try:
+                ZoneInfo(timezone)
+            except (ZoneInfoNotFoundError, ValueError):
+                raise ValueError(
+                    f"Invalid NEXTCLOUD_MCP_TIMEZONE='{timezone}'. Expected an IANA name like Europe/Berlin."
+                ) from None
+
         upload_root_raw = os.environ.get("NEXTCLOUD_MCP_UPLOAD_ROOT", "").strip()
         if upload_root_raw:
             root = Path(upload_root_raw).expanduser()
@@ -104,6 +118,7 @@ class Config:
             multiuser=multiuser,
             multiuser_cache_size=int(cache_size),
             multiuser_ttl=float(ttl),
+            timezone=timezone,
         )
 
     def validate(self) -> None:
