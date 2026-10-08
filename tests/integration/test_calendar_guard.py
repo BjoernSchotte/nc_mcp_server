@@ -162,7 +162,7 @@ class TestGuard:
 
 
 @pytest.fixture
-async def shared_calendar() -> AsyncGenerator[tuple[Config, Config, str, str]]:
+async def shared_calendar() -> AsyncGenerator[tuple[Config, Config, Config, str]]:
     """admin owns a calendar shared read-write with a new member account and read-only with another."""
     admin_config = _get_integration_config()
     admin = NextcloudClient(admin_config)
@@ -214,7 +214,7 @@ async def shared_calendar() -> AsyncGenerator[tuple[Config, Config, str, str]]:
 class TestSharedCalendar:
     @pytest.mark.asyncio
     async def test_member_writes_owner_needs_allow_foreign(
-        self, shared_calendar: tuple[Config, Config, str, str]
+        self, shared_calendar: tuple[Config, Config, Config, str]
     ) -> None:
         admin_config, anna, leser, uri = shared_calendar
         shared_id = f"{uri}_shared_by_{admin_config.user}"
@@ -256,3 +256,130 @@ class TestSharedCalendar:
                 )
         finally:
             await reader.client.close()
+
+
+class TestAttendees:
+    @pytest.mark.asyncio
+    async def test_guests_set_changed_and_shown(self, nc_mcp: McpTestHelper) -> None:
+        user = nc_mcp.client._config.user
+        await nc_mcp.client.ocs_put(f"cloud/users/{user}", data={"key": "email", "value": f"{user}@example.org"})
+        created = json.loads(
+            await nc_mcp.call(
+                "create_event",
+                calendar_id=CAL_ID,
+                summary="mcp-test-guests",
+                start="2027-05-10T13:00:00",
+                end="2027-05-10T16:00:00",
+                timezone="Europe/Berlin",
+                attendees="Karl <karl@example.org>, anna@example.org",
+            )
+        )
+        try:
+            assert created["attendees"] == ["karl@example.org", "anna@example.org"]
+            assert created["attendee_count"] == 2
+            assert created["organizer"] == f"{user}@example.org"
+            assert "/apps/calendar/dayGridMonth/2027-05-10/edit/sidebar/" in created["link"]
+            # Own event with guests: changed without allow_foreign; Karl out, Lea in.
+            updated = json.loads(
+                await nc_mcp.call(
+                    "update_event",
+                    calendar_id=CAL_ID,
+                    event_uid=created["uid"],
+                    add_attendees="lea@example.org",
+                    remove_attendees="karl@example.org",
+                    location="Raum 1",
+                )
+            )
+            assert updated["attendees"] == ["anna@example.org", "lea@example.org"]
+            event = json.loads(await nc_mcp.call("get_event", calendar_id=CAL_ID, event_uid=created["uid"]))
+            assert event["attendees"] == ["anna@example.org", "lea@example.org"]
+            assert event["location"] == "Raum 1"
+            assert event["link"] == updated["link"]
+            with pytest.raises(ToolError, match="Not a guest"):
+                await nc_mcp.call(
+                    "update_event", calendar_id=CAL_ID, event_uid=created["uid"], remove_attendees="x@example.org"
+                )
+        finally:
+            await _delete_quietly(nc_mcp, CAL_ID, created["uid"])
+
+
+class TestForeignInvitation:
+    @pytest.mark.asyncio
+    async def test_attendee_copy_guests_never_changed_profile_without_mail(self, nc_mcp: McpTestHelper) -> None:
+        admin_user = nc_mcp.client._config.user
+        await nc_mcp.client.ocs_put(
+            f"cloud/users/{admin_user}", data={"key": "email", "value": f"{admin_user}@example.org"}
+        )
+        suffix = secrets.token_hex(4)
+        users: list[str] = []
+        try:
+            configs: dict[str, Config] = {}
+            for name, email in (("kal-boss", f"boss-{suffix}@example.org"), ("kal-ohne", "")):
+                user_id = f"{name}-{suffix}"
+                password = f"Mcp-{secrets.token_hex(10)}!"
+                await nc_mcp.client.ocs_post("cloud/users", data={"userid": user_id, "password": password})
+                users.append(user_id)
+                if email:
+                    await nc_mcp.client.ocs_put(f"cloud/users/{user_id}", data={"key": "email", "value": email})
+                configs[name] = Config(
+                    nextcloud_url=nc_mcp.client._config.nextcloud_url,
+                    user=user_id,
+                    password=password,
+                    permission_level=PermissionLevel.DESTRUCTIVE,
+                )
+            boss = _server(configs["kal-boss"])
+            try:
+                created = json.loads(
+                    await boss.call(
+                        "create_event",
+                        calendar_id=CAL_ID,
+                        summary="mcp-test-invite",
+                        start="2027-06-01T10:00:00Z",
+                        attendees=f"{admin_user}@example.org",
+                    )
+                )
+            finally:
+                await boss.client.close()
+            # Nextcloud delivers the invitation into the attendee's default calendar.
+            # (_server sets the global client: a fresh server per account.)
+            gast = _server(_get_integration_config())
+            try:
+                copy = json.loads(await gast.call("get_event", calendar_id=CAL_ID, event_uid=created["uid"]))
+                assert copy["organizer"] == f"boss-{suffix}@example.org"
+                with pytest.raises(ToolError, match="only the organizer"):
+                    await gast.call(
+                        "update_event",
+                        calendar_id=CAL_ID,
+                        event_uid=created["uid"],
+                        add_attendees="x@example.org",
+                        allow_foreign=True,
+                    )
+                with pytest.raises(ToolError, match="allow_foreign"):
+                    await gast.call("update_event", calendar_id=CAL_ID, event_uid=created["uid"], location="Raum 2")
+            finally:
+                await gast.client.close()
+            # Profile without e-mail: guests refused, plain events still work.
+            ohne = _server(configs["kal-ohne"])
+            try:
+                with pytest.raises(ToolError, match="no e-mail address"):
+                    await ohne.call(
+                        "create_event",
+                        calendar_id=CAL_ID,
+                        summary="mcp-test-x",
+                        start="2027-06-02T10:00:00Z",
+                        attendees="a@example.org",
+                    )
+                plain = json.loads(
+                    await ohne.call(
+                        "create_event", calendar_id=CAL_ID, summary="mcp-test-y", start="2027-06-02T10:00:00Z"
+                    )
+                )
+                await ohne.call("update_event", calendar_id=CAL_ID, event_uid=plain["uid"], location="Raum 3")
+            finally:
+                await ohne.client.close()
+        finally:
+            admin = NextcloudClient(_get_integration_config())
+            for user_id in users:
+                with contextlib.suppress(Exception):
+                    await admin.ocs_delete(f"cloud/users/{user_id}")
+            await admin.close()

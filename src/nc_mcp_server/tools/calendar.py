@@ -1,5 +1,6 @@
 """Calendar tools — list calendars, query/create/update/delete events via CalDAV."""
 
+import base64
 import json
 import re
 import uuid
@@ -12,7 +13,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 from icalendar import Calendar as ICal
 from icalendar import Event as IEvent
-from icalendar import vRecur
+from icalendar import vCalAddress, vRecur
 from mcp.server.fastmcp import FastMCP
 
 from ..annotations import ADDITIVE, ADDITIVE_IDEMPOTENT, DESTRUCTIVE, READONLY
@@ -290,6 +291,176 @@ def _has_attendees(component: Any) -> bool:
     return component.get("ATTENDEE") is not None
 
 
+# --- Attendees ------------------------------------------------------------------------------
+# Nextcloud's scheduling plugin sends invitations (iMIP mail to external addresses, the
+# calendar inbox for its own users) when the ORGANIZER is the caller's own address.
+SABRE_NS = "http://sabredav.org/ns"
+EMAIL_RE = re.compile(
+    r"^[!#-'*+\-./-9=?A-Z^-~]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?)+$"
+)
+NAMED_RE = re.compile(r"^(.*?)\s*<([^<>]+)>$")
+# Characters dropped from display names (CN): controls, DEL, backslash (icalendar would keep
+# "\" before the next parameter separator and merge parameters on re-read), line separators.
+CN_DROP = re.compile(r"[\x00-\x1f\x7f\\\u2028\u2029\u0085]")
+
+
+def _clean_name(name: str) -> str:
+    return re.sub(r"\s+", " ", CN_DROP.sub("", name)).strip()[:100]
+
+
+MAX_ATTENDEES = 100
+SHOWN_ATTENDEES = 10
+PRINCIPAL_PROPFIND = (
+    '<?xml version="1.0" encoding="UTF-8"?><d:propfind xmlns:d="DAV:" xmlns:s="http://sabredav.org/ns">'
+    "<d:prop><d:displayname/><s:email-address/></d:prop></d:propfind>"
+)
+
+
+def _parse_attendees(value: str) -> list[tuple[str, str]]:
+    """'a@x.org, Karl Muster <karl@y.de>; ...' -> [(email, name)], lower-cased, de-duplicated."""
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    bad: list[str] = []
+    for raw in re.split(r"[,;\n]", value or ""):
+        item = raw.strip()
+        if not item:
+            continue
+        name = ""
+        named = NAMED_RE.match(item)
+        if named:
+            name, item = named.group(1).strip().strip('"').strip(), named.group(2).strip()
+        if item.lower().startswith("mailto:"):
+            item = item[7:]
+        if not EMAIL_RE.match(item):
+            bad.append(raw.strip())
+            continue
+        email = item.lower()
+        if email not in seen:
+            seen.add(email)
+            out.append((email, _clean_name(name)))
+    if bad:
+        raise ValueError(
+            f"Invalid attendee address(es): {', '.join(bad[:5])}. Use name@example.org or Name <name@example.org>."
+        )
+    if len(out) > MAX_ATTENDEES:
+        raise ValueError(f"At most {MAX_ATTENDEES} attendees per event.")
+    return out
+
+
+def _address(prop: Any) -> str:
+    text = str(prop or "").strip()
+    return (text[7:] if text.lower().startswith("mailto:") else text).lower()
+
+
+def _attendee_props(component: Any) -> list[Any]:
+    props = component.get("ATTENDEE")
+    if props is None:
+        return []
+    return list(props) if isinstance(props, list) else [props]
+
+
+def _attendee_emails(component: Any) -> list[str]:
+    return [a for a in (_address(p) for p in _attendee_props(component)) if a]
+
+
+def _organizer_email(component: Any) -> str:
+    return _address(component.get("ORGANIZER"))
+
+
+def _set_attendees(component: Any, wanted: list[tuple[str, str]], organizer: tuple[str, str]) -> None:
+    """Replace the attendee list. Attendees kept keep their parameters (e.g. their reply).
+    The organizer is set to the caller when there are attendees; the caller is never an attendee."""
+    existing = {_address(p): p for p in _attendee_props(component)}
+    org_email, org_name = organizer
+    if "ATTENDEE" in component:
+        del component["ATTENDEE"]
+    for email, name in wanted:
+        if email == org_email:
+            continue
+        prop = existing.get(email)
+        if prop is None:
+            prop = vCalAddress(f"mailto:{email}")
+            if name:
+                prop.params["CN"] = name
+            prop.params["CUTYPE"] = "INDIVIDUAL"
+            prop.params["ROLE"] = "REQ-PARTICIPANT"
+            prop.params["PARTSTAT"] = "NEEDS-ACTION"
+            prop.params["RSVP"] = "TRUE"
+        component.add("attendee", prop)
+    if wanted and not _organizer_email(component):
+        org = vCalAddress(f"mailto:{org_email}")
+        if org_name:
+            org.params["CN"] = org_name
+        component.add("organizer", org)
+
+
+async def _my_address() -> tuple[str, str]:
+    """The caller's e-mail address and display name from their Nextcloud principal."""
+    user = get_config().user
+    response = await get_client().dav_request(
+        "PROPFIND",
+        f"principals/users/{user}",
+        body=PRINCIPAL_PROPFIND,
+        headers={"Depth": "0", "Content-Type": "application/xml; charset=utf-8"},
+        context="Read your principal",
+    )
+    email, name = "", ""
+    try:
+        root = ET.fromstring(response.text or "")  # noqa: S314
+    except ET.ParseError:
+        root = None
+    resp = root.find(f"{{{DAV_NS}}}response") if root is not None else None
+    prop = find_ok_prop(resp) if resp is not None else None
+    if prop is not None:
+        email = (_el_text(prop, SABRE_NS, "email-address") or "").strip().lower()
+        name = _clean_name(_el_text(prop, DAV_NS, "displayname") or "")
+    if not EMAIL_RE.match(email):
+        raise ValueError(NO_EMAIL)
+    return email, name
+
+
+NO_EMAIL = (
+    "Your Nextcloud account has no e-mail address, so Nextcloud cannot send invitations. "
+    "Set one in the Nextcloud personal settings. Nothing was changed."
+)
+
+
+async def _my_address_or_none() -> tuple[str, str] | None:
+    try:
+        return await _my_address()
+    except ValueError:
+        return None
+
+
+def _event_link(href: str, dtstart: Any) -> str:
+    """Direct link to the event in the Nextcloud Calendar app (edit view).
+
+    The app identifies an event by base64 of its DAV path (routes
+    /:view/:firstDay/edit/sidebar/:object/:recurrenceId). The occurrence is "next": the app
+    resolves it to the occurrence closest to now. A Unix time would have to match the app's
+    own recurrence-id exactly (checked against Calendar 6.6: zoned start times do not)."""
+    path = "/remote.php/dav/" + _href_to_dav_path(href).lstrip("/")
+    obj = base64.b64encode(path.encode()).decode()
+    val = getattr(dtstart, "dt", dtstart)
+    day = val.date().isoformat() if isinstance(val, datetime) else val.isoformat() if isinstance(val, date) else "now"
+    return f"{get_config().nextcloud_url}/apps/calendar/dayGridMonth/{day}/edit/sidebar/{obj}/next"
+
+
+def _event_result(ical_data: str, href: str) -> dict[str, Any]:
+    """Event details for create/update/get: fields of _format_event plus the attendee
+    addresses (first SHOWN_ATTENDEES), their count and the direct link."""
+    cal = ICal.from_ical(ical_data)
+    component = _vevent(cal)
+    result = _format_event(ical_data, get_config().user)
+    emails = _attendee_emails(component)
+    result["attendees"] = emails[:SHOWN_ATTENDEES]
+    result["attendee_count"] = len(emails)
+    if emails:
+        result["organizer"] = _organizer_email(component)
+    result["link"] = _event_link(href, component.get("DTSTART"))
+    return result
+
+
 def _conference_url(component: Any) -> str:
     conf = component.get("CONFERENCE")
     if conf is None:
@@ -318,6 +489,8 @@ def _build_ical(
     rrule: str = "",
     conference_url: str = "",
     created_by: str = "",
+    attendees: list[tuple[str, str]] | None = None,
+    organizer: tuple[str, str] | None = None,
 ) -> str:
     """Build a minimal iCalendar VEVENT string (with VTIMEZONE for zoned times)."""
     cal = ICal()
@@ -343,6 +516,8 @@ def _build_ical(
         _set_conference(event, conference_url)
     if created_by:
         event.add(CREATED_BY_PROP, created_by)
+    if attendees and organizer:
+        _set_attendees(event, attendees, organizer)
     cal.add_component(event)
     cal.add_missing_timezones()
     return cal.to_ical().decode()
@@ -685,10 +860,11 @@ def _register_read_tools(mcp: FastMCP) -> None:
         Returns:
             JSON object with full event details: uid, summary, dtstart, dtend,
             description, location, status, all_day, has_attendees, created_by_me, etag,
-            and optionally rrule, categories, conference (video link).
+            attendees (first 10 addresses), attendee_count, link (opens the event in the
+            Nextcloud Calendar app), and optionally organizer, rrule, categories, conference.
         """
-        _href, etag, ical_data = await _find_event(calendar_id, event_uid)
-        event = _format_event(ical_data, get_config().user)
+        href, etag, ical_data = await _find_event(calendar_id, event_uid)
+        event = _event_result(ical_data, href)
         event["etag"] = etag
         return json.dumps(event)
 
@@ -709,8 +885,9 @@ def _register_create_event(mcp: FastMCP) -> None:
         rrule: str = "",
         timezone: str = "",
         conference_url: str = "",
+        attendees: str = "",
     ) -> str:
-        """Create a new calendar event.
+        """Create a new calendar event, optionally with invited attendees.
 
         Args:
             calendar_id: Calendar identifier (e.g. "personal").
@@ -736,10 +913,15 @@ def _register_create_event(mcp: FastMCP) -> None:
             conference_url: Optional video call link (e.g. a Talk room URL). Stored as
                    CONFERENCE (RFC 7986) and as LOCATION when no location is given,
                    otherwise as a line in the description.
+            attendees: Optional guests, comma-separated e-mail addresses, each optionally as
+                   "Name <address>". You become the organizer and Nextcloud sends the
+                   invitations (mail to external addresses, calendar inbox for its own users).
+                   Requires an e-mail address in your Nextcloud profile.
 
         Returns:
-            JSON object with the created event's uid, summary, dtstart, dtend and,
-            when set, conference.
+            JSON object with the event's uid, summary, dtstart, dtend, all_day, attendees
+            (first 10 addresses), attendee_count, link (opens the event in the Nextcloud
+            Calendar app) and, when set, organizer, conference, rrule.
         """
         status_upper = _validate_status(status)
         cat_list = [c.strip() for c in categories.split(",") if c.strip()] if categories else None
@@ -756,6 +938,8 @@ def _register_create_event(mcp: FastMCP) -> None:
         if type(dtend) is type(dtstart) and dtend < dtstart:
             raise ValueError("The event ends before it starts.")
 
+        guests = _parse_attendees(attendees) if attendees else []
+        organizer = await _my_address() if guests else None
         uid = str(uuid.uuid4())
         client = get_client()
         user = get_config().user
@@ -771,6 +955,8 @@ def _register_create_event(mcp: FastMCP) -> None:
             rrule,
             conference,
             created_by=user,
+            attendees=guests,
+            organizer=organizer,
         )
         path = _caldav_path(user, calendar_id, f"{uid}.ics")
         await client.dav_request(
@@ -780,15 +966,59 @@ def _register_create_event(mcp: FastMCP) -> None:
             headers={"Content-Type": "text/calendar; charset=utf-8"},
             context=f"Create event in '{calendar_id}'",
         )
-        result: dict[str, Any] = {
-            "uid": uid,
-            "summary": summary,
-            "dtstart": _dt_to_str(dtstart),
-            "dtend": _dt_to_str(dtend),
-        }
-        if conference:
-            result["conference"] = conference
-        return json.dumps(result)
+        return json.dumps(_event_result(ical_data, path))
+
+
+async def _guard_and_apply_guests(
+    component: Any,
+    event_uid: str,
+    me: str,
+    attendees: str | None,
+    add_attendees: str,
+    remove_attendees: str,
+    allow_foreign: bool,
+) -> None:
+    """update_event's guard (foreign events need allow_foreign) and guest list changes.
+
+    Only the organizer changes guests: in an attendee's copy that would drop the caller and
+    invite nobody, so it is refused even with allow_foreign. Raises ValueError, changes nothing."""
+    guests_change = attendees is not None or bool(add_attendees.strip()) or bool(remove_attendees.strip())
+    replace = _parse_attendees(attendees) if attendees else []
+    adding = _parse_attendees(add_attendees) if add_attendees.strip() else []
+    removing = {e for e, _ in _parse_attendees(remove_attendees)} if remove_attendees.strip() else set()
+    # Own address only when it matters; without one, an event with attendees counts as foreign.
+    my_address = await _my_address_or_none() if (guests_change or _has_attendees(component)) else None
+    organizer = _organizer_email(component)
+    foreign = _created_by(component) != me or (
+        _has_attendees(component) and (my_address is None or organizer != my_address[0])
+    )
+    if guests_change and my_address is None:
+        raise ValueError(NO_EMAIL)
+    if guests_change and organizer and (my_address is None or organizer != my_address[0]):
+        # Only the organizer invites; changing the list in an attendee's copy would drop
+        # the caller from it and invite nobody. Not even with allow_foreign.
+        raise ValueError(
+            f"Event '{event_uid}' was organized by someone else; only the organizer can change its guests. "
+            "Nothing was changed."
+        )
+    if not allow_foreign and foreign:
+        raise ValueError(
+            f"Event '{event_uid}' was not created by you through this server, or it has attendees "
+            "and another organizer. Nothing was changed. Ask the user, then call update_event "
+            "again with allow_foreign=true."
+        )
+    if guests_change and my_address is not None:
+        current = dict.fromkeys(_attendee_emails(component), "")
+        base = dict(replace) if attendees is not None else current
+        for email, name in adding:
+            base.setdefault(email, name)
+        missing = sorted(removing - set(base))
+        if missing:
+            raise ValueError(f"Not a guest of this event: {', '.join(missing[:5])}. Nothing was changed.")
+        wanted = [(e, n) for e, n in base.items() if e not in removing]
+        if len(wanted) > MAX_ATTENDEES:
+            raise ValueError(f"At most {MAX_ATTENDEES} attendees per event.")
+        _set_attendees(component, wanted, my_address)
 
 
 def _register_update_event(mcp: FastMCP) -> None:
@@ -807,6 +1037,9 @@ def _register_update_event(mcp: FastMCP) -> None:
         rrule: str | None = None,
         timezone: str = "",
         conference_url: str | None = None,
+        attendees: str | None = None,
+        add_attendees: str = "",
+        remove_attendees: str = "",
         allow_foreign: bool = False,
         expected_summary: str = "",
     ) -> str:
@@ -816,8 +1049,9 @@ def _register_update_event(mcp: FastMCP) -> None:
         modified since it was last read, the update will fail with a conflict error.
 
         Events that were not created by the calling user through this server, or that
-        have attendees (who Nextcloud would notify), are only changed with
-        allow_foreign=true. Ask the user before passing it.
+        have attendees and another organizer, are only changed with allow_foreign=true.
+        Ask the user before passing it. On the caller's own events Nextcloud notifies the
+        attendees of changes (new guests get an invitation, removed ones a cancellation).
 
         Args:
             calendar_id: Calendar identifier (e.g. "personal").
@@ -834,12 +1068,15 @@ def _register_update_event(mcp: FastMCP) -> None:
             timezone: IANA zone for new start/end without offset. Default: the event's
                    own zone, else NEXTCLOUD_MCP_TIMEZONE, else UTC.
             conference_url: New video call link. Pass "" to remove the link set before.
+            attendees: New complete guest list (see create_event). Pass "" to remove all guests.
+            add_attendees: Guests to add, comma-separated (see create_event).
+            remove_attendees: Guest addresses to remove, comma-separated.
             allow_foreign: Also change events created by someone else (or with attendees).
             expected_summary: Optional current title; the update is refused if it differs
                    (protects against changing the wrong event).
 
         Returns:
-            Confirmation message with the updated event UID.
+            JSON object with the updated event's details like get_event (attendees, link, ...).
         """
         validated_status = _validate_status(status) if status is not None else None
         cat_list: list[str] | None = None
@@ -850,12 +1087,9 @@ def _register_update_event(mcp: FastMCP) -> None:
         component = _vevent(cal)
         _check_summary(component, expected_summary, event_uid)
         me = get_config().user
-        if not allow_foreign and (_created_by(component) != me or _has_attendees(component)):
-            raise ValueError(
-                f"Event '{event_uid}' was not created by you through this server, or it has attendees "
-                "who would be notified. Nothing was changed. Ask the user, then call update_event "
-                "again with allow_foreign=true."
-            )
+        await _guard_and_apply_guests(
+            component, event_uid, me, attendees, add_attendees, remove_attendees, allow_foreign
+        )
         zone = _effective_zone(timezone, _zone_of(component.get("DTSTART")))
         _apply_event_updates(
             component,
@@ -888,7 +1122,7 @@ def _register_update_event(mcp: FastMCP) -> None:
             headers={"Content-Type": "text/calendar; charset=utf-8", "If-Match": f'"{etag}"'},
             context=f"Update event '{event_uid}'",
         )
-        return f"Event '{event_uid}' updated."
+        return json.dumps(_event_result(cal.to_ical().decode(), href))
 
 
 def _register_destructive_tools(mcp: FastMCP) -> None:
