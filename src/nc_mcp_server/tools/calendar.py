@@ -296,9 +296,18 @@ def _has_attendees(component: Any) -> bool:
 # calendar inbox for its own users) when the ORGANIZER is the caller's own address.
 SABRE_NS = "http://sabredav.org/ns"
 EMAIL_RE = re.compile(
-    r"^[^@\s<>\",;:()\[\]]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?)+$"
+    r"^[!#-'*+\-./-9=?A-Z^-~]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?)+$"
 )
 NAMED_RE = re.compile(r"^(.*?)\s*<([^<>]+)>$")
+# Characters dropped from display names (CN): controls, DEL, backslash (icalendar would keep
+# "\" before the next parameter separator and merge parameters on re-read), line separators.
+CN_DROP = re.compile(r"[\x00-\x1f\x7f\\\u2028\u2029\u0085]")
+
+
+def _clean_name(name: str) -> str:
+    return re.sub(r"\s+", " ", CN_DROP.sub("", name)).strip()[:100]
+
+
 MAX_ATTENDEES = 100
 SHOWN_ATTENDEES = 10
 PRINCIPAL_PROPFIND = (
@@ -322,13 +331,13 @@ def _parse_attendees(value: str) -> list[tuple[str, str]]:
             name, item = named.group(1).strip().strip('"').strip(), named.group(2).strip()
         if item.lower().startswith("mailto:"):
             item = item[7:]
-        if not EMAIL_RE.match(item) or any(ord(c) < 32 for c in name):
+        if not EMAIL_RE.match(item):
             bad.append(raw.strip())
             continue
         email = item.lower()
         if email not in seen:
             seen.add(email)
-            out.append((email, name[:100]))
+            out.append((email, _clean_name(name)))
     if bad:
         raise ValueError(
             f"Invalid attendee address(es): {', '.join(bad[:5])}. Use name@example.org or Name <name@example.org>."
@@ -404,13 +413,23 @@ async def _my_address() -> tuple[str, str]:
     prop = find_ok_prop(resp) if resp is not None else None
     if prop is not None:
         email = (_el_text(prop, SABRE_NS, "email-address") or "").strip().lower()
-        name = (_el_text(prop, DAV_NS, "displayname") or "").strip()
+        name = _clean_name(_el_text(prop, DAV_NS, "displayname") or "")
     if not EMAIL_RE.match(email):
-        raise ValueError(
-            "Your Nextcloud account has no e-mail address, so Nextcloud cannot send invitations. "
-            "Set one in the Nextcloud personal settings. Nothing was changed."
-        )
+        raise ValueError(NO_EMAIL)
     return email, name
+
+
+NO_EMAIL = (
+    "Your Nextcloud account has no e-mail address, so Nextcloud cannot send invitations. "
+    "Set one in the Nextcloud personal settings. Nothing was changed."
+)
+
+
+async def _my_address_or_none() -> tuple[str, str] | None:
+    try:
+        return await _my_address()
+    except ValueError:
+        return None
 
 
 def _event_link(href: str, dtstart: Any) -> str:
@@ -950,6 +969,58 @@ def _register_create_event(mcp: FastMCP) -> None:
         return json.dumps(_event_result(ical_data, path))
 
 
+async def _guard_and_apply_guests(
+    component: Any,
+    event_uid: str,
+    me: str,
+    attendees: str | None,
+    add_attendees: str,
+    remove_attendees: str,
+    allow_foreign: bool,
+) -> None:
+    """update_event's guard (foreign events need allow_foreign) and guest list changes.
+
+    Only the organizer changes guests: in an attendee's copy that would drop the caller and
+    invite nobody, so it is refused even with allow_foreign. Raises ValueError, changes nothing."""
+    guests_change = attendees is not None or bool(add_attendees.strip()) or bool(remove_attendees.strip())
+    replace = _parse_attendees(attendees) if attendees else []
+    adding = _parse_attendees(add_attendees) if add_attendees.strip() else []
+    removing = {e for e, _ in _parse_attendees(remove_attendees)} if remove_attendees.strip() else set()
+    # Own address only when it matters; without one, an event with attendees counts as foreign.
+    my_address = await _my_address_or_none() if (guests_change or _has_attendees(component)) else None
+    organizer = _organizer_email(component)
+    foreign = _created_by(component) != me or (
+        _has_attendees(component) and (my_address is None or organizer != my_address[0])
+    )
+    if guests_change and organizer and (my_address is None or organizer != my_address[0]):
+        # Only the organizer invites; changing the list in an attendee's copy would drop
+        # the caller from it and invite nobody. Not even with allow_foreign.
+        raise ValueError(
+            f"Event '{event_uid}' was organized by someone else; only the organizer can change its guests. "
+            "Nothing was changed."
+        )
+    if guests_change and my_address is None:
+        raise ValueError(NO_EMAIL)
+    if not allow_foreign and foreign:
+        raise ValueError(
+            f"Event '{event_uid}' was not created by you through this server, or it has attendees "
+            "and another organizer. Nothing was changed. Ask the user, then call update_event "
+            "again with allow_foreign=true."
+        )
+    if guests_change and my_address is not None:
+        current = dict.fromkeys(_attendee_emails(component), "")
+        base = dict(replace) if attendees is not None else current
+        for email, name in adding:
+            base.setdefault(email, name)
+        missing = sorted(removing - set(base))
+        if missing:
+            raise ValueError(f"Not a guest of this event: {', '.join(missing[:5])}. Nothing was changed.")
+        wanted = [(e, n) for e, n in base.items() if e not in removing]
+        if len(wanted) > MAX_ATTENDEES:
+            raise ValueError(f"At most {MAX_ATTENDEES} attendees per event.")
+        _set_attendees(component, wanted, my_address)
+
+
 def _register_update_event(mcp: FastMCP) -> None:
     @mcp.tool(annotations=ADDITIVE_IDEMPOTENT)
     @require_permission(PermissionLevel.WRITE)
@@ -1016,32 +1087,9 @@ def _register_update_event(mcp: FastMCP) -> None:
         component = _vevent(cal)
         _check_summary(component, expected_summary, event_uid)
         me = get_config().user
-        guests_change = attendees is not None or bool(add_attendees.strip()) or bool(remove_attendees.strip())
-        replace = _parse_attendees(attendees) if attendees else []
-        adding = _parse_attendees(add_attendees) if add_attendees.strip() else []
-        removing = {e for e, _ in _parse_attendees(remove_attendees)} if remove_attendees.strip() else set()
-        my_address = await _my_address() if (guests_change or _has_attendees(component)) else None
-        foreign = _created_by(component) != me or (
-            _has_attendees(component) and my_address is not None and _organizer_email(component) != my_address[0]
+        await _guard_and_apply_guests(
+            component, event_uid, me, attendees, add_attendees, remove_attendees, allow_foreign
         )
-        if not allow_foreign and foreign:
-            raise ValueError(
-                f"Event '{event_uid}' was not created by you through this server, or it has attendees "
-                "and another organizer. Nothing was changed. Ask the user, then call update_event "
-                "again with allow_foreign=true."
-            )
-        if guests_change and my_address is not None:
-            current = dict.fromkeys(_attendee_emails(component), "")
-            base = dict(replace) if attendees is not None else current
-            for email, name in adding:
-                base.setdefault(email, name)
-            missing = sorted(removing - set(base))
-            if missing:
-                raise ValueError(f"Not a guest of this event: {', '.join(missing[:5])}. Nothing was changed.")
-            wanted = [(e, n) for e, n in base.items() if e not in removing]
-            if len(wanted) > MAX_ATTENDEES:
-                raise ValueError(f"At most {MAX_ATTENDEES} attendees per event.")
-            _set_attendees(component, wanted, my_address)
         zone = _effective_zone(timezone, _zone_of(component.get("DTSTART")))
         _apply_event_updates(
             component,

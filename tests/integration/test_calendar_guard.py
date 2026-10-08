@@ -301,3 +301,85 @@ class TestAttendees:
                 )
         finally:
             await _delete_quietly(nc_mcp, CAL_ID, created["uid"])
+
+
+class TestForeignInvitation:
+    @pytest.mark.asyncio
+    async def test_attendee_copy_guests_never_changed_profile_without_mail(self, nc_mcp: McpTestHelper) -> None:
+        admin_user = nc_mcp.client._config.user
+        await nc_mcp.client.ocs_put(
+            f"cloud/users/{admin_user}", data={"key": "email", "value": f"{admin_user}@example.org"}
+        )
+        suffix = secrets.token_hex(4)
+        users: list[str] = []
+        try:
+            configs: dict[str, Config] = {}
+            for name, email in (("kal-boss", f"boss-{suffix}@example.org"), ("kal-ohne", "")):
+                user_id = f"{name}-{suffix}"
+                password = f"Mcp-{secrets.token_hex(10)}!"
+                await nc_mcp.client.ocs_post("cloud/users", data={"userid": user_id, "password": password})
+                users.append(user_id)
+                if email:
+                    await nc_mcp.client.ocs_put(f"cloud/users/{user_id}", data={"key": "email", "value": email})
+                configs[name] = Config(
+                    nextcloud_url=nc_mcp.client._config.nextcloud_url,
+                    user=user_id,
+                    password=password,
+                    permission_level=PermissionLevel.DESTRUCTIVE,
+                )
+            boss = _server(configs["kal-boss"])
+            try:
+                created = json.loads(
+                    await boss.call(
+                        "create_event",
+                        calendar_id=CAL_ID,
+                        summary="mcp-test-invite",
+                        start="2027-06-01T10:00:00Z",
+                        attendees=f"{admin_user}@example.org",
+                    )
+                )
+            finally:
+                await boss.client.close()
+            # Nextcloud delivers the invitation into the attendee's default calendar.
+            # (_server sets the global client: a fresh server per account.)
+            gast = _server(_get_integration_config())
+            try:
+                copy = json.loads(await gast.call("get_event", calendar_id=CAL_ID, event_uid=created["uid"]))
+                assert copy["organizer"] == f"boss-{suffix}@example.org"
+                with pytest.raises(ToolError, match="only the organizer"):
+                    await gast.call(
+                        "update_event",
+                        calendar_id=CAL_ID,
+                        event_uid=created["uid"],
+                        add_attendees="x@example.org",
+                        allow_foreign=True,
+                    )
+                with pytest.raises(ToolError, match="allow_foreign"):
+                    await gast.call("update_event", calendar_id=CAL_ID, event_uid=created["uid"], location="Raum 2")
+            finally:
+                await gast.client.close()
+            # Profile without e-mail: guests refused, plain events still work.
+            ohne = _server(configs["kal-ohne"])
+            try:
+                with pytest.raises(ToolError, match="no e-mail address"):
+                    await ohne.call(
+                        "create_event",
+                        calendar_id=CAL_ID,
+                        summary="mcp-test-x",
+                        start="2027-06-02T10:00:00Z",
+                        attendees="a@example.org",
+                    )
+                plain = json.loads(
+                    await ohne.call(
+                        "create_event", calendar_id=CAL_ID, summary="mcp-test-y", start="2027-06-02T10:00:00Z"
+                    )
+                )
+                await ohne.call("update_event", calendar_id=CAL_ID, event_uid=plain["uid"], location="Raum 3")
+            finally:
+                await ohne.client.close()
+        finally:
+            admin = NextcloudClient(_get_integration_config())
+            for user_id in users:
+                with contextlib.suppress(Exception):
+                    await admin.ocs_delete(f"cloud/users/{user_id}")
+            await admin.close()

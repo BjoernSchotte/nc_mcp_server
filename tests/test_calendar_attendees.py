@@ -50,7 +50,9 @@ class TestParseAttendees:
     def test_dedupes_case_insensitive(self) -> None:
         assert _parse_attendees("A@x.org, a@X.org") == [("a@x.org", "")]
 
-    @pytest.mark.parametrize("bad", ["karl", "a@b", "a b@x.org", "a@x.org\r\nBCC: e@vil.org", "<>", "a@-x.org"])
+    @pytest.mark.parametrize(
+        "bad", ["karl", "a@b", "a b@x.org", "a@x.org\r\nBCC: e@vil.org", "<>", "a@-x.org", "a\x01b@x.org", "ä@x.org"]
+    )
     def test_rejects_invalid(self, bad: str) -> None:
         with pytest.raises(ValueError, match="Invalid attendee"):
             _parse_attendees(f"ok@x.org, {bad}")
@@ -114,3 +116,23 @@ class TestResultAndLink:
         assert res["attendees"] == []
         assert res["attendee_count"] == 0
         assert "organizer" not in res
+
+
+class TestNames:
+    def test_backslash_del_and_separators_dropped(self) -> None:
+        got = _parse_attendees("Karl\\ <k@x.org>, An\x7fna\u2028 <a@x.org>")
+        assert got == [("k@x.org", "Karl"), ("a@x.org", "Anna")]
+
+    def test_cn_with_cleaned_name_roundtrips(self) -> None:
+        cal = ICal.from_ical(_event(_parse_attendees("Karl\\ <k@x.org>")))
+        again = _vevent(ICal.from_ical(cal.to_ical()))
+        prop = again.get("ATTENDEE")
+        assert str(prop.params["CN"]) == "Karl"
+        assert prop.params["CUTYPE"] == "INDIVIDUAL"
+
+    def test_single_existing_attendee_keeps_reply_on_replace(self) -> None:
+        cal = ICal.from_ical(_event([("a@x.org", "")]))
+        comp = _vevent(ICal.from_ical(cal.to_ical()))
+        comp.get("ATTENDEE").params["PARTSTAT"] = "ACCEPTED"
+        _set_attendees(comp, [("a@x.org", ""), ("b@x.org", "")], ME)
+        assert [str(p.params["PARTSTAT"]) for p in comp.get("ATTENDEE")] == ["ACCEPTED", "NEEDS-ACTION"]

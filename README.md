@@ -443,6 +443,8 @@ instead of the placeholders Talk stores (`{mention-user1}`, `{file}`).
   invitations, updates and cancellations. `create_event`, `update_event` and `get_event` return the event details
   with the first 10 attendee addresses, `attendee_count`, `organizer` and `link`, a direct link that opens the
   event in the Calendar app. `get_events` only says `has_attendees`.
+  Only the organizer changes guests (refused in an attendee's copy, even with `allow_foreign`). Breaking change:
+  `update_event` returns this JSON instead of the text "Event '<uid>' updated."
 - Shared calendars appear as `<uri>_shared_by_<owner>` for the people they are shared with.
 
 ### Contacts
