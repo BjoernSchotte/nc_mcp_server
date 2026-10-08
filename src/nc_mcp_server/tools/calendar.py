@@ -992,6 +992,8 @@ async def _guard_and_apply_guests(
     foreign = _created_by(component) != me or (
         _has_attendees(component) and (my_address is None or organizer != my_address[0])
     )
+    if guests_change and my_address is None:
+        raise ValueError(NO_EMAIL)
     if guests_change and organizer and (my_address is None or organizer != my_address[0]):
         # Only the organizer invites; changing the list in an attendee's copy would drop
         # the caller from it and invite nobody. Not even with allow_foreign.
@@ -999,8 +1001,6 @@ async def _guard_and_apply_guests(
             f"Event '{event_uid}' was organized by someone else; only the organizer can change its guests. "
             "Nothing was changed."
         )
-    if guests_change and my_address is None:
-        raise ValueError(NO_EMAIL)
     if not allow_foreign and foreign:
         raise ValueError(
             f"Event '{event_uid}' was not created by you through this server, or it has attendees "
