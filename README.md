@@ -415,8 +415,8 @@ instead of the placeholders Talk stores (`{mention-user1}`, `{file}`).
 | `list_calendars` | read | List user's calendars |
 | `get_events` | read | Get events from a calendar (with date filtering) |
 | `get_event` | read | Get a single event by UID |
-| `create_event` | write | Create a calendar event (time zone, checked RRULE, video link) |
-| `update_event` | write | Update an event (partial updates supported) |
+| `create_event` | write | Create a calendar event (time zone, checked RRULE, video link, invited attendees) |
+| `update_event` | write | Update an event (partial updates supported; set, add or remove attendees) |
 | `delete_event` | destructive | Delete a calendar event |
 | `get_calendar_shares` | read | Who a calendar is shared with, public link (owner only) |
 | `create_calendar` | write | Create a calendar, optionally shared with a group right away |
@@ -435,9 +435,14 @@ instead of the placeholders Talk stores (`{mention-user1}`, `{file}`).
 - Video link: `conference_url` is stored as `CONFERENCE` (RFC 7986) and as `LOCATION` when empty (as Nextcloud
   Calendar does for Talk rooms), else as a `Video call: <url>` line in the description.
 - Creator guard: `create_event` marks events with `X-NC-MCP-CREATED-BY:<user id>`. `update_event` refuses events
-  without the caller's mark, or with attendees (Nextcloud would notify them), unless `allow_foreign=true`, so a
-  client can ask its user first. `update_event`/`delete_event` take `expected_summary` and refuse to act if the
-  title differs. Event output never lists attendees or organizers, only `has_attendees` and `created_by_me`.
+  without the caller's mark, or with attendees and another organizer, unless `allow_foreign=true`, so a client can
+  ask its user first. `update_event`/`delete_event` take `expected_summary` and refuse to act if the title differs.
+- Attendees: `create_event(attendees=...)` and `update_event(attendees=/add_attendees=/remove_attendees=)` take
+  comma-separated addresses (`name@example.org` or `Name <name@example.org>`, at most 100). The caller becomes the
+  ORGANIZER with the e-mail address of their Nextcloud profile (required), and Nextcloud's scheduling sends the
+  invitations, updates and cancellations. `create_event`, `update_event` and `get_event` return the event details
+  with the first 10 attendee addresses, `attendee_count`, `organizer` and `link`, a direct link that opens the
+  event in the Calendar app. `get_events` only says `has_attendees`.
 - Shared calendars appear as `<uri>_shared_by_<owner>` for the people they are shared with.
 
 ### Contacts

@@ -162,7 +162,7 @@ class TestGuard:
 
 
 @pytest.fixture
-async def shared_calendar() -> AsyncGenerator[tuple[Config, Config, str, str]]:
+async def shared_calendar() -> AsyncGenerator[tuple[Config, Config, Config, str]]:
     """admin owns a calendar shared read-write with a new member account and read-only with another."""
     admin_config = _get_integration_config()
     admin = NextcloudClient(admin_config)
@@ -214,7 +214,7 @@ async def shared_calendar() -> AsyncGenerator[tuple[Config, Config, str, str]]:
 class TestSharedCalendar:
     @pytest.mark.asyncio
     async def test_member_writes_owner_needs_allow_foreign(
-        self, shared_calendar: tuple[Config, Config, str, str]
+        self, shared_calendar: tuple[Config, Config, Config, str]
     ) -> None:
         admin_config, anna, leser, uri = shared_calendar
         shared_id = f"{uri}_shared_by_{admin_config.user}"
@@ -256,3 +256,48 @@ class TestSharedCalendar:
                 )
         finally:
             await reader.client.close()
+
+
+class TestAttendees:
+    @pytest.mark.asyncio
+    async def test_guests_set_changed_and_shown(self, nc_mcp: McpTestHelper) -> None:
+        user = nc_mcp.client._config.user
+        await nc_mcp.client.ocs_put(f"cloud/users/{user}", data={"key": "email", "value": f"{user}@example.org"})
+        created = json.loads(
+            await nc_mcp.call(
+                "create_event",
+                calendar_id=CAL_ID,
+                summary="mcp-test-guests",
+                start="2027-05-10T13:00:00",
+                end="2027-05-10T16:00:00",
+                timezone="Europe/Berlin",
+                attendees="Karl <karl@example.org>, anna@example.org",
+            )
+        )
+        try:
+            assert created["attendees"] == ["karl@example.org", "anna@example.org"]
+            assert created["attendee_count"] == 2
+            assert created["organizer"] == f"{user}@example.org"
+            assert "/apps/calendar/dayGridMonth/2027-05-10/edit/sidebar/" in created["link"]
+            # Own event with guests: changed without allow_foreign; Karl out, Lea in.
+            updated = json.loads(
+                await nc_mcp.call(
+                    "update_event",
+                    calendar_id=CAL_ID,
+                    event_uid=created["uid"],
+                    add_attendees="lea@example.org",
+                    remove_attendees="karl@example.org",
+                    location="Raum 1",
+                )
+            )
+            assert updated["attendees"] == ["anna@example.org", "lea@example.org"]
+            event = json.loads(await nc_mcp.call("get_event", calendar_id=CAL_ID, event_uid=created["uid"]))
+            assert event["attendees"] == ["anna@example.org", "lea@example.org"]
+            assert event["location"] == "Raum 1"
+            assert event["link"] == updated["link"]
+            with pytest.raises(ToolError, match="Not a guest"):
+                await nc_mcp.call(
+                    "update_event", calendar_id=CAL_ID, event_uid=created["uid"], remove_attendees="x@example.org"
+                )
+        finally:
+            await _delete_quietly(nc_mcp, CAL_ID, created["uid"])
