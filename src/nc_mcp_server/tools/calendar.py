@@ -414,21 +414,17 @@ async def _my_address() -> tuple[str, str]:
 
 
 def _event_link(href: str, dtstart: Any) -> str:
-    """Direct link to the event in the Nextcloud Calendar app (edit sidebar).
+    """Direct link to the event in the Nextcloud Calendar app (edit view).
 
-    The app identifies an event by base64 of its DAV path and the occurrence by its start
-    as Unix seconds (routes /:view/:firstDay/edit/sidebar/:object/:recurrenceId)."""
+    The app identifies an event by base64 of its DAV path (routes
+    /:view/:firstDay/edit/sidebar/:object/:recurrenceId). The occurrence is "next": the app
+    resolves it to the occurrence closest to now. A Unix time would have to match the app's
+    own recurrence-id exactly (checked against Calendar 6.6: zoned start times do not)."""
     path = "/remote.php/dav/" + _href_to_dav_path(href).lstrip("/")
     obj = base64.b64encode(path.encode()).decode()
     val = getattr(dtstart, "dt", dtstart)
-    if isinstance(val, datetime):
-        start = val if val.tzinfo else val.replace(tzinfo=UTC)
-        day, ts = start.date().isoformat(), int(start.timestamp())
-    elif isinstance(val, date):
-        day, ts = val.isoformat(), int(datetime.combine(val, time(), tzinfo=UTC).timestamp())
-    else:
-        day, ts = "now", "next"
-    return f"{get_config().nextcloud_url}/apps/calendar/dayGridMonth/{day}/edit/sidebar/{obj}/{ts}"
+    day = val.date().isoformat() if isinstance(val, datetime) else val.isoformat() if isinstance(val, date) else "now"
+    return f"{get_config().nextcloud_url}/apps/calendar/dayGridMonth/{day}/edit/sidebar/{obj}/next"
 
 
 def _event_result(ical_data: str, href: str) -> dict[str, Any]:

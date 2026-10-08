@@ -1,7 +1,7 @@
 """Unit tests for attendees: parsing, setting the guest list, organizer, result and link."""
 
 import base64
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -102,15 +102,12 @@ class TestResultAndLink:
         assert res["organizer"] == "bjoern@example.org"
         assert res["summary"] == "CoP Treffen"
         obj = base64.b64encode(b"/remote.php/dav/calendars/bjoern/it-verband/uid-1.ics").decode()
-        ts = int(datetime(2026, 10, 15, 11, 0, tzinfo=UTC).timestamp())
-        assert res["link"] == f"https://cloud.example.org/apps/calendar/dayGridMonth/2026-10-15/edit/sidebar/{obj}/{ts}"
+        assert res["link"] == f"https://cloud.example.org/apps/calendar/dayGridMonth/2026-10-15/edit/sidebar/{obj}/next"
 
     def test_link_from_full_href_and_all_day(self) -> None:
         link = _event_link("/remote.php/dav/calendars/bjoern/p/x.ics", SimpleNamespace(dt=date(2026, 12, 24)))
         obj = base64.b64encode(b"/remote.php/dav/calendars/bjoern/p/x.ics").decode()
-        assert link.endswith(
-            f"/dayGridMonth/2026-12-24/edit/sidebar/{obj}/{int(datetime(2026, 12, 24, tzinfo=UTC).timestamp())}"
-        )
+        assert link.endswith(f"/dayGridMonth/2026-12-24/edit/sidebar/{obj}/next")
 
     def test_without_guests(self) -> None:
         res = _event_result(_event(), "calendars/bjoern/p/uid-1.ics")
