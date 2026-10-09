@@ -198,6 +198,17 @@ nc-mcp-server --transport http
   (e.g. for a read-only service account behind the same server).
 - The server trusts whoever can reach it with a valid app password; put it on a private network.
   `NEXTCLOUD_MCP_UPLOAD_ROOT` is not available in this mode.
+- Limits per login, `NEXTCLOUD_MCP_LOGIN_PATHS` (JSON object, keys match login or user ID,
+  case-insensitively). Every other endpoint is refused before Nextcloud is asked:
+  - `{"service-reader": ["Shared/Public"]}`: only WebDAV files below these folders.
+  - `{"service-reader": {"paths": ["Shared/Public"], "collectives_group": "Members"}}`: also read,
+    and only read, the collectives whose team (circle) has the group `Members` as a direct member,
+    with their files. Not a fixed list: the server asks Nextcloud with that login which collectives it
+    sees and whose teams contain the group, and caches the answer
+    (`NEXTCLOUD_MCP_COLLECTIVES_SCOPE_TTL` seconds, default 60). `paths` may be empty. Such a login is
+    always `read`, also when Nextcloud lets it write: write methods are refused even below `paths`;
+    share, trash and write endpoints stay refused. The login must itself be in the group
+    to see those collectives at all.
 
 ### Stdio Mode (default)
 

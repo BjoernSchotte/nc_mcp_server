@@ -12,6 +12,11 @@ future, that builds a URL through the client. Paths are compared after NFC norma
 empty segments are dropped; ``.``, ``..``, control characters, backslashes and ``%`` are
 refused outright for restricted logins (no second decoding round can turn them into a
 traversal). Prefix matching is by whole path segments: ``Shared`` does not match ``Shared2``.
+
+Long form of an entry: ``{"login": {"paths": [...], "collectives_group": "Members"}}``. With
+``collectives_group`` the login may also read, and only read, the collectives whose team has
+that Nextcloud group as a direct member (see collectives_scope.py); ``paths`` may then be empty
+or left out.
 """
 
 import json
@@ -42,9 +47,21 @@ def normalize(path: str) -> str | None:
 
 
 def parse_login_paths(raw: str) -> dict[str, tuple[str, ...]]:
-    """Parse the JSON value of NEXTCLOUD_MCP_LOGIN_PATHS. Raises ValueError when unusable."""
+    """The path prefixes of NEXTCLOUD_MCP_LOGIN_PATHS (see parse_login_limits)."""
+    return parse_login_limits(raw)[0]
+
+
+_LONG_KEYS = frozenset({"paths", "collectives_group"})
+
+
+def parse_login_limits(raw: str) -> tuple[dict[str, tuple[str, ...]], dict[str, str]]:
+    """Parse NEXTCLOUD_MCP_LOGIN_PATHS into (login -> prefixes, login -> collectives group).
+
+    Every listed login is restricted and appears in the first mapping, with an empty tuple when it
+    only reads collectives. Raises ValueError when unusable.
+    """
     if not raw.strip():
-        return {}
+        return {}, {}
     try:
         data: object = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -53,24 +70,72 @@ def parse_login_paths(raw: str) -> dict[str, tuple[str, ...]]:
         # ValueError like every other config error (Config.from_env contract), not TypeError.
         raise ValueError("NEXTCLOUD_MCP_LOGIN_PATHS must be a JSON object: {login: [path prefixes]}.")  # noqa: TRY004
     out: dict[str, tuple[str, ...]] = {}
+    groups: dict[str, str] = {}
     entries = cast(dict[object, object], data)
-    for login, prefixes in entries.items():
+    for login, value in entries.items():
         if not isinstance(login, str) or not login.strip():
             raise ValueError("NEXTCLOUD_MCP_LOGIN_PATHS: logins must be non-empty strings.")
-        if not isinstance(prefixes, list) or not prefixes:
-            raise ValueError(f"NEXTCLOUD_MCP_LOGIN_PATHS[{login!r}]: a non-empty list of path prefixes is required.")
-        clean: list[str] = []
-        for p in cast(list[object], prefixes):
-            n = normalize(p) if isinstance(p, str) else None
-            if not n:
-                raise ValueError(
-                    f"NEXTCLOUD_MCP_LOGIN_PATHS[{login!r}]: invalid prefix {p!r} (no root, '.', '..', '%' or '\\')."
-                )
-            clean.append(n)
         if any(k.casefold() == login.casefold() for k in out):
             raise ValueError(f"NEXTCLOUD_MCP_LOGIN_PATHS: {login!r} is listed twice (logins match case-insensitively).")
-        out[login] = tuple(dict.fromkeys(clean))
-    return out
+        prefixes, group = _entry(login, value)
+        out[login] = _prefixes(login, prefixes)
+        if group is not None:
+            groups[login] = group
+    return out, groups
+
+
+def _entry(login: str, value: object) -> tuple[list[object], str | None]:
+    """One entry: a list of prefixes (short form) or {"paths": [...], "collectives_group": "..."}."""
+    if isinstance(value, list) and value:
+        return cast(list[object], value), None
+    if not isinstance(value, dict):
+        raise ValueError(f"NEXTCLOUD_MCP_LOGIN_PATHS[{login!r}]: a non-empty list of path prefixes is required.")  # noqa: TRY004
+    entry = cast(dict[object, object], value)
+    unknown = [k for k in entry if k not in _LONG_KEYS]
+    if unknown:
+        raise ValueError(f"NEXTCLOUD_MCP_LOGIN_PATHS[{login!r}]: unknown keys {unknown!r}.")
+    group = _group(login, entry.get("collectives_group"))
+    prefixes = entry.get("paths", [])
+    if not isinstance(prefixes, list):
+        raise ValueError(f"NEXTCLOUD_MCP_LOGIN_PATHS[{login!r}]: 'paths' must be a list of path prefixes.")  # noqa: TRY004
+    if not prefixes and group is None:
+        raise ValueError(f"NEXTCLOUD_MCP_LOGIN_PATHS[{login!r}]: give 'paths', 'collectives_group' or both.")
+    return cast(list[object], prefixes), group
+
+
+def _prefixes(login: str, prefixes: list[object]) -> tuple[str, ...]:
+    clean: list[str] = []
+    for p in prefixes:
+        n = normalize(p) if isinstance(p, str) else None
+        if not n:
+            raise ValueError(
+                f"NEXTCLOUD_MCP_LOGIN_PATHS[{login!r}]: invalid prefix {p!r} (no root, '.', '..', '%' or '\\')."
+            )
+        clean.append(n)
+    return tuple(dict.fromkeys(clean))
+
+
+def _group(login: str, value: object) -> str | None:
+    """A collectives group name: a non-blank string without control characters, or None if absent."""
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > 255
+        or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value)
+    ):
+        raise ValueError(f"NEXTCLOUD_MCP_LOGIN_PATHS[{login!r}]: 'collectives_group' must be a group name.")
+    return value
+
+
+def group_for(groups: dict[str, str], login: str, user_id: str) -> str | None:
+    """Collectives group of an account, matched like prefixes_for. Two different groups: None (fail closed)."""
+    if not groups:
+        return None
+    keys = {k.casefold(): v for k, v in groups.items()}
+    found = {keys[n.casefold()] for n in dict.fromkeys((login, user_id)) if n and n.casefold() in keys}
+    return found.pop() if len(found) == 1 else None
 
 
 def inside(path: str, prefixes: tuple[str, ...]) -> bool:

@@ -9,12 +9,17 @@ from collections.abc import AsyncIterable, Callable
 from typing import Any, cast
 from urllib.parse import quote as url_quote
 from urllib.parse import unquote as url_unquote
+from urllib.parse import urlsplit
 
 import niquests
 from urllib3.util import Retry, Timeout
 
+from .collectives_scope import CollectivesScope, check_collectives_request, is_collectives_ocs
 from .config import Config
 from .login_paths import PathNotAllowedError, check_request
+
+# WebDAV methods that only read: the only ones a collectives scope widens (collectives_scope.py).
+_READ_METHODS = frozenset({"PROPFIND", "GET", "HEAD", "SEARCH"})
 
 log = logging.getLogger(__name__)
 
@@ -263,6 +268,12 @@ class NextcloudClient:
         self._in_flight: dict[int, int] = {}
         # One login at a time: calls that hit an expired session together share the reset
         self._reset_lock = asyncio.Lock()
+        # Restricted login with a collectives group (NEXTCLOUD_MCP_LOGIN_PATHS long form)
+        self.collectives_scope: CollectivesScope | None = (
+            CollectivesScope(self, config.collectives_group, ttl=config.collectives_scope_ttl)
+            if config.collectives_group and config.path_prefixes is not None
+            else None
+        )
 
     async def _get_session(self) -> niquests.AsyncSession:
         if self._session is None:
@@ -313,11 +324,16 @@ class NextcloudClient:
         else:
             await old.close()
 
-    async def _send(self, session: niquests.AsyncSession, method: str, url: str, **kwargs: Any) -> niquests.Response:
-        """Send a request through a session, closing the session afterwards if it was replaced meanwhile."""
+    async def _send(
+        self, session: niquests.AsyncSession, method: str, url: str, *, checked: bool = True, **kwargs: Any
+    ) -> niquests.Response:
+        """Send a request through a session, closing the session afterwards if it was replaced meanwhile.
+
+        checked=False only for the collectives scope's own lookups (ocs_get_unchecked).
+        """
         # Every session request passes here (streaming upload included): restricted logins are
         # checked at this one place (NEXTCLOUD_MCP_LOGIN_PATHS).
-        self._check_login_paths(method, url, kwargs)
+        await self._check_login_paths(method, url, kwargs, checked=checked)
         key = id(session)
         self._in_flight[key] = self._in_flight.get(key, 0) + 1
         try:
@@ -400,43 +416,79 @@ class NextcloudClient:
             pass
         session.auth = saved_auth
 
-    def _check_login_paths(self, method: str, url: str, kwargs: dict[str, Any]) -> None:
+    async def _check_login_paths(self, method: str, url: str, kwargs: dict[str, Any], *, checked: bool = True) -> None:
         """Restricted login (NEXTCLOUD_MCP_LOGIN_PATHS): refuse before anything is sent."""
         prefixes = self._config.path_prefixes
         if prefixes is None:
             return
-        try:
+        if checked:
+            try:
+                await self._check_restricted(method, url, kwargs, prefixes)
+            except PathNotAllowedError as exc:
+                raise NextcloudError(str(exc), 403) from None
+        # A redirect would leave the checked URL: never follow one for a restricted login.
+        kwargs["allow_redirects"] = False
+
+    async def _check_restricted(self, method: str, url: str, kwargs: dict[str, Any], prefixes: tuple[str, ...]) -> None:
+        """Path prefixes first; then, for a login with a collectives group, the collectives it may read."""
+
+        def files(allowed: tuple[str, ...]) -> None:
             check_request(
                 method,
                 url,
                 kwargs.get("headers"),
                 base_url=self._base_url,
                 dav_user=self._dav_user,
-                prefixes=prefixes,
+                prefixes=allowed,
                 user=self._config.user,
                 body=kwargs.get("data"),
             )
-        except PathNotAllowedError as exc:
-            raise NextcloudError(str(exc), 403) from None
-        # A redirect would leave the checked URL: never follow one for a restricted login.
-        kwargs["allow_redirects"] = False
 
-    async def _do_request(self, method: str, url: str, **kwargs: Any) -> niquests.Response:
+        scope = self.collectives_scope
+        if scope is not None and method.upper() not in _READ_METHODS:
+            # A login with a collectives group only reads, also in its own folders: Nextcloud may let
+            # it write there (its group can edit), nc-mcp never does (besides the permission cap).
+            raise PathNotAllowedError("This login only reads.")
+        ocs = is_collectives_ocs(url, self._base_url)
+        dav_read = method.upper() in _READ_METHODS and urlsplit(url).path.startswith(
+            urlsplit(self._base_url).path.rstrip("/") + "/remote.php/dav/"
+        )
+        try:
+            files(prefixes)
+        except PathNotAllowedError:
+            # Nothing else asks for the scope: other apps and writes stay refused without a lookup.
+            if scope is None or not (ocs or dav_read):
+                raise
+        else:
+            return
+        try:
+            view = await scope.view()
+        except NextcloudError as exc:
+            log.warning("Collectives of this login could not be checked (%s)", exc)
+            raise PathNotAllowedError("The collectives of this login could not be checked; try again later.") from None
+        if ocs:
+            check_collectives_request(method, url, base_url=self._base_url, view=view)
+        else:
+            files(prefixes + view.prefixes)
+
+    async def _do_request(self, method: str, url: str, *, checked: bool = True, **kwargs: Any) -> niquests.Response:
         """Execute an HTTP request, retrying once if a cached session expired or lacks a password confirmation."""
         session = await self._get_session()
         # Taken per request: a concurrent call can swap self._session while this one is in flight
         cached = session.auth is None
-        response = await self._send(session, method, url, **kwargs)
+        response = await self._send(session, method, url, checked=checked, **kwargs)
         if await self._should_retry_auth(response, session):
             session = await self._get_session()
             cached = session.auth is None
-            response = await self._send(session, method, url, **kwargs)
+            response = await self._send(session, method, url, checked=checked, **kwargs)
         if cached and _needs_password_confirmation(response):
             log.debug("Password confirmation missing, repeating %s %s with a fresh login", method, url)
-            response = await self._request_with_password(method, url, **kwargs)
+            response = await self._request_with_password(method, url, checked=checked, **kwargs)
         return response
 
-    async def _request_with_password(self, method: str, url: str, **kwargs: Any) -> niquests.Response:
+    async def _request_with_password(
+        self, method: str, url: str, *, checked: bool = True, **kwargs: Any
+    ) -> niquests.Response:
         """Send one request as a fresh Basic Auth login, outside the cached session.
 
         The cached session's password confirmation expires after 30 minutes, and the session never
@@ -445,7 +497,7 @@ class NextcloudClient:
         'allowed_no_password_confirmation_ranges' apply, which Nextcloud skips for session logins.
         A login also sets up the user's files from scratch, which a session does not always do.
         """
-        self._check_login_paths(method, url, kwargs)
+        await self._check_login_paths(method, url, kwargs, checked=checked)
         log.debug("Sending %s %s with a fresh login", method, url)
         session = self._build_session()
         try:
@@ -482,6 +534,17 @@ class NextcloudClient:
         _raise_for_ocs_status(response, f"OCS GET {path}")
         if response.status_code == 304:
             return None
+        result: dict[str, Any] = response.json()  # type: ignore[assignment]
+        return result["ocs"]["data"]
+
+    async def ocs_get_unchecked(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        """OCS GET past the path limits of a restricted login: only for the collectives scope's own lookups.
+
+        Never call it from a tool; what it returns is not limited to what the login may show.
+        """
+        url = f"{self._base_url}/ocs/v2.php/{path}"
+        response = await self._do_request("GET", url, checked=False, params=params or {})
+        _raise_for_ocs_status(response, f"OCS GET {path}")
         result: dict[str, Any] = response.json()  # type: ignore[assignment]
         return result["ocs"]["data"]
 
