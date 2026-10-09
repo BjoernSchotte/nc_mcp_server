@@ -138,3 +138,35 @@ class TestClient:
         ):
             await c.dav_put(PAGE, b"neu")
         assert calls == ["PUT", "PROPFIND"]
+
+
+class TestFollowUp:
+    def test_until_with_date_when_not_today(self) -> None:
+        long_lock = {
+            **TEXT_LOCK,
+            "lock-owner-type": 0,
+            "lock-owner-displayname": "Kim Beispiel",
+            "lock-timeout": 2 * 86400,
+        }
+        m = describe_lock(PAGE, parse_lock_props(lock_xml(**long_lock)), now=T_LOCK, timezone="Europe/Berlin")
+        assert "until 2026-10-11 14:24 Europe/Berlin" in m
+        short = {**long_lock, "lock-timeout": 1800}
+        assert "until 14:54 Europe/Berlin" in describe_lock(
+            PAGE, parse_lock_props(lock_xml(**short)), now=T_LOCK, timezone="Europe/Berlin"
+        )
+
+    async def test_move_names_the_locked_destination(self) -> None:
+        calls: list[str] = []
+        dest = "Kollektive/Vereinswiki/Ziel.md"
+        c = client_with([resp(423), resp(207, lock_xml(lock=0)), resp(207, lock_xml(**TEXT_LOCK))], calls)
+        with pytest.raises(NextcloudError) as err:
+            await c.dav_move(PAGE, dest)
+        assert f"'{dest}' is locked by the Text editor" in str(err.value)
+        assert calls == ["MOVE", "PROPFIND", "PROPFIND"]
+
+    async def test_move_source_locked_reads_only_the_source(self) -> None:
+        calls: list[str] = []
+        c = client_with([resp(423), resp(207, lock_xml(**TEXT_LOCK))], calls)
+        with pytest.raises(NextcloudError, match=f"'{PAGE}' is locked by the Text editor"):
+            await c.dav_move(PAGE, "Kollektive/Vereinswiki/Ziel.md")
+        assert calls == ["MOVE", "PROPFIND"]
