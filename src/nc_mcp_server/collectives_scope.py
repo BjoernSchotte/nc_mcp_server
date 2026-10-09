@@ -21,6 +21,12 @@ lookup of a team leaves that collective out; a failed listing refuses the reques
 
 The list endpoints answer with everything the login sees; the collectives tools filter those
 answers by the same set (tools/collectives.py).
+
+Per request, ``X-Nextcloud-MCP-Collectives-Group: <group>`` puts the same limit on any login (a
+person's own, multi-user mode): only the collectives of that group, read **and write** (create,
+change, move between them, trash, delete pages; their files: read and PUT), nothing else of
+Nextcloud. A login that already has a collectives group stays read-only; a header naming another
+group than its own reaches no collectives at all.
 """
 
 import asyncio
@@ -47,6 +53,42 @@ _LIST_ENDPOINTS = frozenset({"collectives", "collectives/search/recent"})
 _ID = r"[1-9][0-9]{0,18}"
 _PER_COLLECTIVE = re.compile(rf"collectives/({_ID})/(?:pages|search|tags|pages/{_ID}|pages/{_ID}/attachments)")
 _CIRCLE_ID = re.compile(r"[A-Za-z0-9]{1,64}")
+# Writes of a writable scope (header): (method, pattern); group 1 = collective, "to" = target collective.
+_WRITES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("GET", re.compile(rf"collectives/({_ID})/pages/{_ID}/touch")),
+    ("POST", re.compile(rf"collectives/({_ID})/pages/{_ID}")),
+    ("PUT", re.compile(rf"collectives/({_ID})/pages/{_ID}")),
+    ("PUT", re.compile(rf"collectives/({_ID})/pages/{_ID}/emoji")),
+    ("PUT", re.compile(rf"collectives/({_ID})/pages/{_ID}/to/(?P<to>{_ID})")),
+    ("DELETE", re.compile(rf"collectives/({_ID})/pages/{_ID}")),
+    ("DELETE", re.compile(rf"collectives/({_ID})/pages/trash/{_ID}")),
+)
+GROUP_HEADER = "x-nextcloud-mcp-collectives-group"
+
+# The group of the running request (multi-user middleware registers the provider).
+_group_provider: Callable[[], str | None] | None = None
+
+
+def set_request_group_provider(provider: Callable[[], str | None] | None) -> None:
+    """Register the function that returns the running request's collectives group header."""
+    global _group_provider
+    _group_provider = provider
+
+
+def request_group() -> str | None:
+    """The collectives group of the running request, or None."""
+    return _group_provider() if _group_provider is not None else None
+
+
+def parse_group_header(value: str | None) -> str | None:
+    """Parse X-Nextcloud-MCP-Collectives-Group: printable ASCII group name. ValueError when unusable."""
+    if value is None:
+        return None
+    if not value.strip() or len(value) > 255 or any(not (0x20 <= ord(ch) < 0x7F) for ch in value):
+        raise ValueError("Invalid X-Nextcloud-MCP-Collectives-Group: a group name in printable ASCII.")
+    return value
+
+
 _REFUSED = "This collective is not available for this login."
 
 
@@ -64,8 +106,12 @@ def is_collectives_ocs(url: str, base_url: str) -> bool:
     return urlsplit(url).path.startswith(root)
 
 
-def check_collectives_request(method: str, url: str, *, base_url: str, view: ScopeView) -> None:
-    """Allow a Collectives OCS request of a scoped login, or raise PathNotAllowedError."""
+def check_collectives_request(method: str, url: str, *, base_url: str, view: ScopeView, writable: bool = False) -> None:
+    """Allow a Collectives OCS request of a scoped login, or raise PathNotAllowedError.
+
+    writable: also the page writes of _WRITES (header scope); every collective they touch, the
+    target of a move included, must be in the view.
+    """
     parts = urlsplit(url)
     base = urlsplit(base_url)
     if parts.query or parts.fragment:
@@ -73,14 +119,31 @@ def check_collectives_request(method: str, url: str, *, base_url: str, view: Sco
     if parts.netloc and (parts.scheme, parts.netloc) != (base.scheme, base.netloc):
         raise PathNotAllowedError(_REFUSED)
     root = base.path.rstrip("/") + f"/ocs/v2.php/{API}/"
-    if method.upper() != "GET" or not parts.path.startswith(root):
+    if not parts.path.startswith(root):
         raise PathNotAllowedError(_REFUSED)
     rest = parts.path[len(root) :]
-    if rest in _LIST_ENDPOINTS:
+    m = method.upper()
+    if m == "GET":
+        if rest in _LIST_ENDPOINTS:
+            return
+        match = _PER_COLLECTIVE.fullmatch(rest)
+        if match is not None and int(match.group(1)) in view.ids:
+            return
+    if writable and _write_allowed(m, rest, view):
         return
-    match = _PER_COLLECTIVE.fullmatch(rest)
-    if match is None or int(match.group(1)) not in view.ids:
-        raise PathNotAllowedError(_REFUSED)
+    raise PathNotAllowedError(_REFUSED)
+
+
+def _write_allowed(method: str, rest: str, view: ScopeView) -> bool:
+    """A page write of _WRITES whose collectives (a move's target too) are all in the view."""
+    for verb, pattern in _WRITES:
+        hit = pattern.fullmatch(rest) if verb == method else None
+        if hit is None:
+            continue
+        targets = [int(hit.group(1))] + ([int(hit.group("to"))] if "to" in pattern.groupindex else [])
+        if all(t in view.ids for t in targets):
+            return True
+    return False
 
 
 def _is_group(m: dict[str, Any], group: str) -> bool:

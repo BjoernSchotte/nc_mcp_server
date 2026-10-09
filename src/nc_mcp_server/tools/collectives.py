@@ -88,7 +88,8 @@ def _collective_id(page: dict[str, Any]) -> int | None:
 
 async def _visible_ids(client: NextcloudClient) -> frozenset[int] | None:
     """IDs a login with a collectives group may see (the list endpoints answer with all it can see), else None."""
-    scope = getattr(client, "collectives_scope", None)
+    active = getattr(client, "active_collectives_scope", None)
+    scope = active() if callable(active) else None
     if not isinstance(scope, CollectivesScope):
         return None
     return (await scope.view()).ids

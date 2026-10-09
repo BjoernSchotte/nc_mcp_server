@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 import niquests
 from urllib3.util import Retry, Timeout
 
-from .collectives_scope import CollectivesScope, check_collectives_request, is_collectives_ocs
+from .collectives_scope import CollectivesScope, check_collectives_request, is_collectives_ocs, request_group
 from .config import Config
 from .login_paths import PathNotAllowedError, check_request
 
@@ -274,6 +274,29 @@ class NextcloudClient:
             if config.collectives_group and config.path_prefixes is not None
             else None
         )
+        # Per-request group (X-Nextcloud-MCP-Collectives-Group): one scope per group, cached here.
+        self._group_scopes: dict[str, CollectivesScope] = {}
+
+    def _restriction(self) -> tuple[tuple[str, ...] | None, CollectivesScope | None, bool]:
+        """(path prefixes or None = unrestricted, collectives scope, read-only) of the running request."""
+        header = request_group()
+        prefixes = self._config.path_prefixes
+        if prefixes is not None:
+            scope = self.collectives_scope
+            if header is not None and (scope is None or header != scope.group):
+                scope = None  # another group than the login's own: no collectives (fail closed)
+            return prefixes, scope, self._config.collectives_group is not None
+        if header is None:
+            return None, None, False
+        scope = self._group_scopes.get(header)
+        if scope is None:
+            scope = CollectivesScope(self, header, ttl=self._config.collectives_scope_ttl)
+            self._group_scopes[header] = scope
+        return (), scope, False
+
+    def active_collectives_scope(self) -> CollectivesScope | None:
+        """The collectives scope of the running request (login's own or the header's), if any."""
+        return self._restriction()[1]
 
     async def _get_session(self) -> niquests.AsyncSession:
         if self._session is None:
@@ -417,20 +440,28 @@ class NextcloudClient:
         session.auth = saved_auth
 
     async def _check_login_paths(self, method: str, url: str, kwargs: dict[str, Any], *, checked: bool = True) -> None:
-        """Restricted login (NEXTCLOUD_MCP_LOGIN_PATHS): refuse before anything is sent."""
-        prefixes = self._config.path_prefixes
+        """Restricted login or request (NEXTCLOUD_MCP_LOGIN_PATHS, collectives group header): refuse before sending."""
+        prefixes, scope, read_only = self._restriction()
         if prefixes is None:
             return
         if checked:
             try:
-                await self._check_restricted(method, url, kwargs, prefixes)
+                await self._check_restricted(method, url, kwargs, prefixes, scope, read_only)
             except PathNotAllowedError as exc:
                 raise NextcloudError(str(exc), 403) from None
         # A redirect would leave the checked URL: never follow one for a restricted login.
         kwargs["allow_redirects"] = False
 
-    async def _check_restricted(self, method: str, url: str, kwargs: dict[str, Any], prefixes: tuple[str, ...]) -> None:
-        """Path prefixes first; then, for a login with a collectives group, the collectives it may read."""
+    async def _check_restricted(
+        self,
+        method: str,
+        url: str,
+        kwargs: dict[str, Any],
+        prefixes: tuple[str, ...],
+        scope: CollectivesScope | None,
+        read_only: bool,
+    ) -> None:
+        """Path prefixes first; then the collectives of the scope (read, and write unless read_only)."""
 
         def files(allowed: tuple[str, ...]) -> None:
             check_request(
@@ -444,20 +475,20 @@ class NextcloudClient:
                 body=kwargs.get("data"),
             )
 
-        scope = self.collectives_scope
-        if scope is not None and method.upper() not in _READ_METHODS:
+        m = method.upper()
+        if read_only and m not in _READ_METHODS:
             # A login with a collectives group only reads, also in its own folders: Nextcloud may let
             # it write there (its group can edit), nc-mcp never does (besides the permission cap).
             raise PathNotAllowedError("This login only reads.")
         ocs = is_collectives_ocs(url, self._base_url)
-        dav_read = method.upper() in _READ_METHODS and urlsplit(url).path.startswith(
-            urlsplit(self._base_url).path.rstrip("/") + "/remote.php/dav/"
-        )
+        dav = urlsplit(url).path.startswith(urlsplit(self._base_url).path.rstrip("/") + "/remote.php/dav/")
+        # Files of a collective: read; with a writable scope also PUT (page text). Nothing else.
+        dav_ok = dav and (m in _READ_METHODS or (m == "PUT" and not read_only))
         try:
             files(prefixes)
         except PathNotAllowedError:
-            # Nothing else asks for the scope: other apps and writes stay refused without a lookup.
-            if scope is None or not (ocs or dav_read):
+            # Nothing else asks for the scope: other apps and other writes stay refused without a lookup.
+            if scope is None or not (ocs or dav_ok):
                 raise
         else:
             return
@@ -467,9 +498,11 @@ class NextcloudClient:
             log.warning("Collectives of this login could not be checked (%s)", exc)
             raise PathNotAllowedError("The collectives of this login could not be checked; try again later.") from None
         if ocs:
-            check_collectives_request(method, url, base_url=self._base_url, view=view)
-        else:
+            check_collectives_request(method, url, base_url=self._base_url, view=view, writable=not read_only)
+        elif m in _READ_METHODS:
             files(prefixes + view.prefixes)
+        else:
+            files(view.prefixes)
 
     async def _do_request(self, method: str, url: str, *, checked: bool = True, **kwargs: Any) -> niquests.Response:
         """Execute an HTTP request, retrying once if a cached session expired or lacks a password confirmation."""
