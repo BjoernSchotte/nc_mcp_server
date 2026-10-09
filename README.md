@@ -210,6 +210,13 @@ nc-mcp-server --transport http
     always `read`, also when Nextcloud lets it write: write methods are refused even below `paths`;
     share, trash and write endpoints stay refused. The login must itself be in the group
     to see those collectives at all.
+- `X-Nextcloud-MCP-Collectives-Group: <group>` (per request, printable ASCII) limits any login to the
+  collectives of that group, same rule and cache as above, but **read and write**: create, change,
+  move (only between collectives of the group), trash and delete pages, and their files (read, `PUT`).
+  Shares, tags, collectives themselves, restore, and everything else of Nextcloud are refused before
+  sending. Use it to let a person write with their own account in a shared place without exposing
+  what else they see. A login with `collectives_group` stays read-only; a header with another group
+  than its own reaches no collectives. Lists (`list_collectives`, recent pages) show only that group.
 
 ### Stdio Mode (default)
 

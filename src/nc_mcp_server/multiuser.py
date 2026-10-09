@@ -22,6 +22,8 @@ Rules:
 * A request can lower, never raise, the server's permission level with the
   ``X-Nextcloud-MCP-Permissions`` header (e.g. ``read`` for a read-only service account).
   A login with a collectives group (``NEXTCLOUD_MCP_LOGIN_PATHS`` long form) is always ``read``.
+* ``X-Nextcloud-MCP-Collectives-Group: <group>`` limits the request to the collectives of that
+  group (collectives_scope.py); it can only narrow what the login reaches.
 """
 
 import asyncio
@@ -45,6 +47,7 @@ from mcp.server.lowlevel.server import request_ctx
 
 from .client import NextcloudClient
 from .config import Config
+from .collectives_scope import GROUP_HEADER, parse_group_header, set_request_group_provider
 from .login_paths import group_for, prefixes_for
 from .permissions import PermissionLevel, set_cap_provider
 
@@ -88,6 +91,8 @@ class Binding:
     client: NextcloudClient
     config: Config
     permission_cap: PermissionLevel | None = None
+    # X-Nextcloud-MCP-Collectives-Group: only the collectives of this group (collectives_scope.py).
+    collectives_group: str | None = None
 
 
 def parse_basic_auth(value: str | None) -> Credentials | None:
@@ -327,6 +332,15 @@ def current_cap(level: PermissionLevel) -> PermissionLevel:
 set_cap_provider(current_cap)
 
 
+def current_group() -> str | None:
+    """The collectives group header of the running multi-user request, if any."""
+    binding = _binding_from_request_context() or _binding.get()
+    return None if binding is None else binding.collectives_group
+
+
+set_request_group_provider(current_group)
+
+
 @contextlib.contextmanager
 def bind(binding: Binding) -> Generator[None]:
     """Run code as one login (tests, scripts). The middleware does the same per request."""
@@ -361,9 +375,9 @@ class MultiUserAuthMiddleware:
             await _reply(send, 401, "Authentication required: send 'Authorization: Basic <login:app-password>'.")
             return
         try:
-            cap = parse_permission_cap(headers.get(PERMISSIONS_HEADER))
-        except ValueError:
-            await _reply(send, 400, "Invalid X-Nextcloud-MCP-Permissions: use read, write or destructive.")
+            cap, group = _request_limits(headers)
+        except ValueError as exc:
+            await _reply(send, 400, str(exc))
             return
         try:
             client, config = await self.pool.get(creds)
@@ -378,7 +392,7 @@ class MultiUserAuthMiddleware:
         if config.collectives_group is not None:
             # A login with a collectives group only ever reads (NEXTCLOUD_MCP_LOGIN_PATHS long form).
             level = lowest(level, PermissionLevel.READ)
-        binding = Binding(client=client, config=config, permission_cap=level)
+        binding = Binding(client=client, config=config, permission_cap=level, collectives_group=group)
         state = scope.setdefault("state", {})
         state[_SCOPE_KEY] = binding
         token = _binding.set(binding)
@@ -400,6 +414,15 @@ class MultiUserAuthMiddleware:
             await _reply(send, 401, "Authentication required: send 'Authorization: Basic <login:app-password>'.")
             return
         await self.app(scope, _replay(body, receive), send)
+
+
+def _request_limits(headers: dict[str, str]) -> tuple[PermissionLevel | None, str | None]:
+    """Permission cap and collectives group of a request. ValueError (message for a 400) when invalid."""
+    try:
+        cap = parse_permission_cap(headers.get(PERMISSIONS_HEADER))
+    except ValueError:
+        raise ValueError("Invalid X-Nextcloud-MCP-Permissions: use read, write or destructive.") from None
+    return cap, parse_group_header(headers.get(GROUP_HEADER))
 
 
 def is_discovery_body(body: bytes) -> bool:
@@ -451,7 +474,7 @@ def _headers(scope: dict[str, Any]) -> dict[str, str]:
     for raw_name, raw_value in raw_headers:
         name = raw_name.decode("latin-1").lower()
         # A repeated Authorization or permissions header is ambiguous: refuse rather than pick one.
-        if name in out and name in ("authorization", PERMISSIONS_HEADER):
+        if name in out and name in ("authorization", PERMISSIONS_HEADER, GROUP_HEADER):
             out[name] = _AMBIGUOUS
             continue
         out[name] = raw_value.decode("latin-1")
