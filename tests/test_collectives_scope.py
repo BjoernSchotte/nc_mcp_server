@@ -19,7 +19,7 @@ from nc_mcp_server.collectives_scope import CollectivesScope, ScopeView, check_c
 from nc_mcp_server.config import Config
 from nc_mcp_server.login_paths import PathNotAllowedError, group_for, parse_login_limits, parse_login_paths
 from nc_mcp_server.multiuser import Binding, ClientPool, Credentials, MultiUserAuthMiddleware, bind
-from nc_mcp_server.permissions import PermissionLevel
+from nc_mcp_server.permissions import PermissionDeniedError, PermissionLevel
 from nc_mcp_server.server import create_server
 
 BASE = "http://nc.invalid"
@@ -445,3 +445,71 @@ class TestToolsFilterLists:
         out = await self._call(client, "list_collectives")
         assert [c["id"] for c in out["data"]] == [1, 2, 3, 4]
         assert client.collectives_scope is None
+
+
+class TestReadOnlyEvenWhenNextcloudAllowsWrites:
+    """The account may write in Nextcloud (group Mitglieder can edit); nc-mcp still only reads."""
+
+    @pytest.fixture(autouse=True)
+    def _server(self) -> Any:
+        self.mcp = create_server(
+            Config(nextcloud_url=BASE, multiuser=True, permission_level=PermissionLevel.DESTRUCTIVE)
+        )
+        yield
+        state_module.set_state(None, Config())
+
+    def test_every_tool_declares_its_level(self) -> None:
+        tools = self.mcp._tool_manager.list_tools()
+        assert len(tools) > 100
+        missing = [t.name for t in tools if not hasattr(t.fn, "_required_permission")]
+        assert missing == []
+
+    async def test_no_write_or_destructive_tool_runs_for_the_scoped_login(self) -> None:
+        calls: list[tuple[str, str]] = []
+        client = scoped_client(calls)
+        # What a cap-free middleware would hand on; the pool forces READ (TestPoolAndCap), and so does this.
+        binding = Binding(client=client, config=client._config, permission_cap=PermissionLevel.READ)
+        writers = [
+            t
+            for t in self.mcp._tool_manager.list_tools()
+            if t.fn._required_permission is not PermissionLevel.READ  # type: ignore[attr-defined]
+        ]
+        assert {"update_collective_page", "create_collective_page", "upload_file", "create_share"} <= {
+            t.name for t in writers
+        }
+        with bind(binding):
+            for tool in writers:
+                with pytest.raises(PermissionDeniedError):
+                    await tool.fn()
+        assert calls == []
+
+    async def test_gate_refuses_writes_even_inside_the_path_prefixes(self) -> None:
+        # Defence in depth behind the cap: a login with a collectives group never writes, not even in
+        # its own folders (Allgemein is writable for the group in Nextcloud).
+        calls: list[tuple[str, str]] = []
+        client = scoped_client(calls)
+        for call in [
+            client.dav_put("Allgemein/neu.md", b"x"),
+            client.dav_delete("Allgemein/Satzung.md"),
+            client.dav_mkcol("Allgemein/Neu"),
+            client.dav_move("Allgemein/a.md", "Allgemein/b.md"),
+        ]:
+            with pytest.raises(NextcloudError) as err:
+                await call
+            assert err.value.status_code == 403
+        assert calls == []
+        await client.dav_get("Allgemein/Satzung.md")
+        assert calls == [("GET", f"{FILES}/Allgemein/Satzung.md")]
+
+    async def test_path_only_login_keeps_its_writes(self) -> None:
+        client = NextcloudClient(
+            Config(nextcloud_url=BASE, user="writer", password="pw", is_app_password=True, path_prefixes=("Shared",))
+        )
+        session = AsyncMock()
+        resp = niquests.Response()
+        resp.status_code = 201
+        resp._content = b""
+        session.request = AsyncMock(return_value=resp)
+        client._get_session = AsyncMock(return_value=session)  # type: ignore[method-assign]
+        await client.dav_put("Shared/a.md", b"x")
+        session.request.assert_awaited()

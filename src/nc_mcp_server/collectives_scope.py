@@ -8,7 +8,8 @@ direct member, and nothing else of Collectives:
   the search, the tags and a page's attachments of a collective in that set. Share, trash and
   ``touch`` endpoints, every write, and every other app stay refused.
 * WebDAV: reading (``PROPFIND``, ``GET``, ``HEAD``, ``SEARCH``) below the folders of exactly those
-  collectives, on top of the login's own path prefixes.
+  collectives, on top of the login's own path prefixes. Such a login never writes, not even below
+  its path prefixes, whatever rights Nextcloud gives it (and its permission cap is always READ).
 
 The set is not configured: it is read from Nextcloud with the login itself (collectives it sees,
 their team's members, the folder of each) and cached for a short time

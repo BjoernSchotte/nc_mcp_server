@@ -206,7 +206,8 @@ nc-mcp-server --transport http
     with their files. Not a fixed list: the server asks Nextcloud with that login which collectives it
     sees and whose teams contain the group, and caches the answer
     (`NEXTCLOUD_MCP_COLLECTIVES_SCOPE_TTL` seconds, default 60). `paths` may be empty. Such a login is
-    always `read`; share, trash and write endpoints stay refused. The login must itself be in the group
+    always `read`, also when Nextcloud lets it write: write methods are refused even below `paths`;
+    share, trash and write endpoints stay refused. The login must itself be in the group
     to see those collectives at all.
 
 ### Stdio Mode (default)

@@ -445,6 +445,10 @@ class NextcloudClient:
             )
 
         scope = self.collectives_scope
+        if scope is not None and method.upper() not in _READ_METHODS:
+            # A login with a collectives group only reads, also in its own folders: Nextcloud may let
+            # it write there (its group can edit), nc-mcp never does (besides the permission cap).
+            raise PathNotAllowedError("This login only reads.")
         ocs = is_collectives_ocs(url, self._base_url)
         dav_read = method.upper() in _READ_METHODS and urlsplit(url).path.startswith(
             urlsplit(self._base_url).path.rstrip("/") + "/remote.php/dav/"
