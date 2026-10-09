@@ -15,7 +15,7 @@ import pytest
 
 import nc_mcp_server.state as state_module
 from nc_mcp_server.client import NextcloudClient, NextcloudError
-from nc_mcp_server.collectives_scope import CollectivesScope, ScopeView, check_collectives_request
+from nc_mcp_server.collectives_scope import CollectivesScope, ScopeView, check_collectives_request, has_group
 from nc_mcp_server.config import Config
 from nc_mcp_server.login_paths import PathNotAllowedError, group_for, parse_login_limits, parse_login_paths
 from nc_mcp_server.multiuser import Binding, ClientPool, Credentials, MultiUserAuthMiddleware, bind
@@ -35,7 +35,7 @@ COLLECTIVES = [
     {"id": 4, "name": "Nur Unterteam", "circleId": "c4"},
 ]
 GROUP_MEMBER = {"userId": "Mitglieder", "userType": 2, "status": "Member", "level": 1}
-MEMBERS = {
+MEMBERS: dict[str, list[dict[str, Any]]] = {
     "c1": [{"userId": "anna", "userType": 1, "status": "Member", "level": 9}, GROUP_MEMBER],
     "c2": [{"userId": "Vorstand", "userType": 2, "status": "Member", "level": 1}, {"userId": BOT, "userType": 1}],
     "c3": [GROUP_MEMBER],
@@ -518,3 +518,56 @@ class TestReadOnlyEvenWhenNextcloudAllowsWrites:
         client._get_session = AsyncMock(return_value=session)  # type: ignore[method-assign]
         await client.dav_put("Shared/a.md", b"x")
         session.request.assert_awaited()
+
+
+# Nextcloud 34 (live, 09.10.2026): an added group shows up as the hidden team mirroring it.
+BASED_ON: dict[str, Any] = {
+    "name": "group:Mitglieder",
+    "displayName": "Mitglieder",
+    "source": 2,
+    "config": 1540,
+    "population": 22,
+}
+GROUP_TEAM: dict[str, Any] = {
+    "userType": 16,
+    "userId": "Mitglieder",
+    "singleId": "abcDEF123ghiJKL456mnoPQR789stu",
+    "status": "Member",
+    "level": 1,
+    "basedOn": BASED_ON,
+}
+
+
+class TestGroupAsMirroredTeam:
+    def test_group_team_with_source_2_counts(self) -> None:
+        assert has_group([GROUP_TEAM], "Mitglieder")
+
+    @pytest.mark.parametrize(
+        "member",
+        [
+            {**GROUP_TEAM, "basedOn": {**BASED_ON, "source": 16}},  # real sub-team, same name
+            {k: v for k, v in GROUP_TEAM.items() if k != "basedOn"},  # basedOn missing
+            {**GROUP_TEAM, "basedOn": None},
+            {**GROUP_TEAM, "basedOn": {**BASED_ON, "name": "group:Vorstand"}},
+            {**GROUP_TEAM, "basedOn": {**BASED_ON, "name": "Mitglieder"}},
+            {**GROUP_TEAM, "status": "Invited"},
+            {k: v for k, v in GROUP_TEAM.items() if k != "status"},
+            {**GROUP_TEAM, "level": 0},
+            {**GROUP_TEAM, "userType": 1},
+        ],
+    )
+    def test_everything_else_does_not(self, member: dict[str, Any]) -> None:
+        assert not has_group([member], "Mitglieder")
+
+    async def test_scope_sees_collectives_of_the_mirrored_group(self) -> None:
+        calls: list[tuple[str, str]] = []
+        client = scoped_client(calls)
+        saved = dict(MEMBERS)
+        MEMBERS["c1"] = [GROUP_TEAM]
+        MEMBERS["c3"] = [{**GROUP_TEAM, "basedOn": {**BASED_ON, "source": 16}}]
+        try:
+            view = await client.collectives_scope.view()  # type: ignore[union-attr]
+            assert view.ids == frozenset({1})
+        finally:
+            MEMBERS.clear()
+            MEMBERS.update(saved)

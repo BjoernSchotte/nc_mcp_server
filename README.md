@@ -202,7 +202,8 @@ nc-mcp-server --transport http
   case-insensitively). Every other endpoint is refused before Nextcloud is asked:
   - `{"service-reader": ["Shared/Public"]}`: only WebDAV files below these folders.
   - `{"service-reader": {"paths": ["Shared/Public"], "collectives_group": "Members"}}`: also read,
-    and only read, the collectives whose team (circle) has the group `Members` as a direct member,
+    and only read, the collectives whose team (circle) has the group `Members` as a direct member
+    (also as the hidden team Teams uses to mirror a group: `basedOn.source` 2),
     with their files. Not a fixed list: the server asks Nextcloud with that login which collectives it
     sees and whose teams contain the group, and caches the answer
     (`NEXTCLOUD_MCP_COLLECTIVES_SCOPE_TTL` seconds, default 60). `paths` may be empty. Such a login is

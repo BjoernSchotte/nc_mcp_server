@@ -14,9 +14,10 @@ direct member, and nothing else of Collectives:
 The set is not configured: it is read from Nextcloud with the login itself (collectives it sees,
 their team's members, the folder of each) and cached for a short time
 (``NEXTCLOUD_MCP_COLLECTIVES_SCOPE_TTL``). A collective shared with the group shows up, one whose
-team drops the group goes, within that time. Only a direct group membership counts; a team that
-contains another team with the group does not. A failed lookup of a team leaves that collective
-out; a failed listing refuses the request (fail closed).
+team drops the group goes, within that time. Only a direct group membership counts (as a group
+member, or as the hidden team Teams creates to mirror the group: userType 16, basedOn.source 2,
+basedOn.name "group:<group>"); a real sub-team that contains the group does not. A failed
+lookup of a team leaves that collective out; a failed listing refuses the request (fail closed).
 
 The list endpoints answer with everything the login sees; the collectives tools filter those
 answers by the same set (tools/collectives.py).
@@ -40,6 +41,8 @@ log = logging.getLogger(__name__)
 
 API = "apps/collectives/api/v1.0"
 GROUP_MEMBER = 2  # Circles member type of a Nextcloud group
+CIRCLE_MEMBER = 16  # Circles member type of a team (also the hidden team that mirrors a group)
+GROUP_SOURCE = 2  # basedOn.source of the hidden team that mirrors a Nextcloud group
 _LIST_ENDPOINTS = frozenset({"collectives", "collectives/search/recent"})
 _ID = r"[1-9][0-9]{0,18}"
 _PER_COLLECTIVE = re.compile(rf"collectives/({_ID})/(?:pages|search|tags|pages/{_ID}|pages/{_ID}/attachments)")
@@ -80,6 +83,25 @@ def check_collectives_request(method: str, url: str, *, base_url: str, view: Sco
         raise PathNotAllowedError(_REFUSED)
 
 
+def _is_group(m: dict[str, Any], group: str) -> bool:
+    """Does this team member stand for the Nextcloud group itself?
+
+    Teams lists an added Nextcloud group either as a group member (userType 2, userId = group) or,
+    as Nextcloud 34 does, as the hidden team that mirrors the group: userType 16 with
+    basedOn.source 2 and basedOn.name "group:<group>". A real sub-team (basedOn.source 16) of the
+    same name does not count.
+    """
+    if m.get("userType") == GROUP_MEMBER:
+        return m.get("userId") == group
+    if m.get("userType") != CIRCLE_MEMBER:
+        return False
+    based = m.get("basedOn")
+    if not isinstance(based, dict):
+        return False
+    b = cast(dict[str, Any], based)
+    return b.get("source") == GROUP_SOURCE and b.get("name") == f"group:{group}"
+
+
 def has_group(members: object, group: str) -> bool:
     """Is the group a direct, active member of a team (members as the Circles API lists them)?"""
     if not isinstance(members, list):
@@ -89,13 +111,7 @@ def has_group(members: object, group: str) -> bool:
             continue
         m = cast(dict[str, Any], raw)
         level = m.get("level")
-        if (
-            m.get("userType") == GROUP_MEMBER
-            and m.get("userId") == group
-            and m.get("status") == "Member"
-            and isinstance(level, int)
-            and level >= 1
-        ):
+        if _is_group(m, group) and m.get("status") == "Member" and isinstance(level, int) and level >= 1:
             return True
     return False
 
