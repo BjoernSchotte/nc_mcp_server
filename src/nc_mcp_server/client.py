@@ -1,6 +1,7 @@
 """HTTP client for Nextcloud REST/OCS/DAV APIs."""
 
 import asyncio
+import time
 import contextlib
 import logging
 import re
@@ -16,6 +17,7 @@ from urllib3.util import Retry, Timeout
 
 from .collectives_scope import CollectivesScope, check_collectives_request, is_collectives_ocs, request_group
 from .config import Config
+from .dav_lock import LOCK_PROPFIND_BODY, describe_lock, parse_lock_props
 from .login_paths import PathNotAllowedError, check_request
 
 # WebDAV methods that only read: the only ones a collectives scope widens (collectives_scope.py).
@@ -734,10 +736,29 @@ class NextcloudClient:
         content_type = str(ct).split(";")[0].strip()
         return response.content or b"", content_type
 
+    async def _raise_if_locked(self, response: niquests.Response, path: str) -> None:
+        """HTTP 423 on a write: read who holds the lock (PROPFIND Depth 0) and say so. Never retried."""
+        if response.status_code != 423:
+            return
+        props: dict[str, str] = {}
+        try:
+            info = await self._do_request(
+                "PROPFIND",
+                self._files_url(path),
+                data=LOCK_PROPFIND_BODY,
+                headers={"Depth": "0", "Content-Type": "application/xml; charset=utf-8"},
+            )
+            if info.status_code == 207:
+                props = parse_lock_props(info.text or "")
+        except NextcloudError:
+            props = {}  # holder unknown; the message says so
+        raise NextcloudError(describe_lock(path, props, now=time.time(), timezone=self._config.timezone), 423)
+
     async def dav_put(self, path: str, content: bytes, content_type: str = "application/octet-stream") -> None:
         """PUT (upload/overwrite) a file via WebDAV."""
         url = self._files_url(path)
         response = await self._do_request("PUT", url, data=content, headers={"Content-Type": content_type})
+        await self._raise_if_locked(response, path)
         _raise_for_status(response, f"Upload file '{path}'")
 
     async def dav_put_stream(
@@ -770,12 +791,14 @@ class NextcloudClient:
         if await self._should_retry_auth(response, session):
             session = await self._get_session()
             response = await self._send(session, "PUT", url, data=chunks_factory(), headers=headers, timeout=timeout)
+        await self._raise_if_locked(response, path)
         _raise_for_status(response, f"Upload file '{path}'")
 
     async def dav_delete(self, path: str) -> None:
         """DELETE a file or folder via WebDAV."""
         url = self._files_url(path)
         response = await self._do_request("DELETE", url)
+        await self._raise_if_locked(response, path)
         _raise_for_status(response, f"Delete '{path}'")
 
     async def dav_mkcol(self, path: str) -> None:
@@ -804,6 +827,7 @@ class NextcloudClient:
             src_url,
             headers={"Destination": dest_url, "Overwrite": "F"},
         )
+        await self._raise_if_locked(response, source)
         _raise_for_status(response, f"Move '{source}' to '{destination}'")
 
     # --- Trashbin DAV ---
