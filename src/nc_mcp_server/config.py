@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .login_paths import parse_login_paths
+from .login_paths import parse_login_limits
 from .permissions import PermissionLevel
 
 
@@ -35,6 +35,11 @@ class Config:
         NEXTCLOUD_MCP_LOGIN_PATHS: JSON object {login: [folder prefixes]} (multi-user mode only).
             A listed login may only reach WebDAV files below its prefixes; every other endpoint
             is refused before Nextcloud is asked (see login_paths.py). Unset: no limits.
+            Long form {login: {"paths": [...], "collectives_group": "Members"}}: the login also
+            reads, and only reads, the collectives whose team has that group as a direct member
+            (see collectives_scope.py); such a login is always read-only.
+        NEXTCLOUD_MCP_COLLECTIVES_SCOPE_TTL: Seconds the list of a login's collectives (long form
+            above) is cached before Nextcloud is asked again (default: 60).
         NEXTCLOUD_MCP_TIMEZONE: IANA time zone (e.g. Europe/Berlin) for calendar times given without
             an offset. Events then carry a TZID and a VTIMEZONE. Unset: such times are UTC.
     """
@@ -60,6 +65,11 @@ class Config:
     login_paths: dict[str, tuple[str, ...]] = field(default_factory=dict[str, tuple[str, ...]])
     # Set per login in multi-user mode: the prefixes of this client's login, None = unrestricted.
     path_prefixes: tuple[str, ...] | None = field(default=None)
+    # Multi-user mode: login -> group whose collectives it may read (NEXTCLOUD_MCP_LOGIN_PATHS long form).
+    login_collectives: dict[str, str] = field(default_factory=dict[str, str])
+    # Set per login in multi-user mode: the group of this client's login, None = no collectives scope.
+    collectives_group: str | None = field(default=None)
+    collectives_scope_ttl: float = field(default=60.0)
 
     @property
     def auth_login(self) -> str:
@@ -93,7 +103,8 @@ class Config:
         cache_size = _env_number("NEXTCLOUD_MCP_MULTIUSER_CACHE_SIZE", "64", int, minimum=1)
         ttl = _env_number("NEXTCLOUD_MCP_MULTIUSER_TTL", "900", float, minimum=1)
 
-        login_paths = parse_login_paths(os.environ.get("NEXTCLOUD_MCP_LOGIN_PATHS", ""))
+        login_paths, login_collectives = parse_login_limits(os.environ.get("NEXTCLOUD_MCP_LOGIN_PATHS", ""))
+        scope_ttl = _env_number("NEXTCLOUD_MCP_COLLECTIVES_SCOPE_TTL", "60", float, minimum=1)
 
         timezone = os.environ.get("NEXTCLOUD_MCP_TIMEZONE", "").strip()
         if timezone:
@@ -130,6 +141,8 @@ class Config:
             multiuser_ttl=float(ttl),
             timezone=timezone,
             login_paths=login_paths,
+            login_collectives=login_collectives,
+            collectives_scope_ttl=float(scope_ttl),
         )
 
     def validate(self) -> None:
@@ -152,7 +165,7 @@ class Config:
                     f"Set them before starting the MCP server."
                 )
             return
-        if self.login_paths:
+        if self.login_paths or self.login_collectives:
             raise ValueError("NEXTCLOUD_MCP_LOGIN_PATHS needs NEXTCLOUD_MCP_MULTIUSER=true.")
         if not self.user:
             missing.append("NEXTCLOUD_USER")

@@ -8,6 +8,7 @@ from mcp.server.fastmcp import FastMCP
 
 from ..annotations import ADDITIVE, ADDITIVE_IDEMPOTENT, DESTRUCTIVE, READONLY
 from ..client import NextcloudClient, NextcloudError
+from ..collectives_scope import CollectivesScope
 from ..permissions import PermissionLevel, require_permission
 from ..state import get_client, get_config
 from .circles import (
@@ -81,6 +82,14 @@ def _collective_id(page: dict[str, Any]) -> int | None:
     return int(match.group(1)) if match else None
 
 
+async def _visible_ids(client: NextcloudClient) -> frozenset[int] | None:
+    """IDs a login with a collectives group may see (the list endpoints answer with all it can see), else None."""
+    scope = getattr(client, "collectives_scope", None)
+    if not isinstance(scope, CollectivesScope):
+        return None
+    return (await scope.view()).ids
+
+
 async def _write_page(collective_id: int, page: dict[str, Any], content: str) -> dict[str, Any]:
     """Replace a page's Markdown file, then tell Collectives, which records who changed it and when."""
     client = get_client()
@@ -109,7 +118,10 @@ def _register_read_tools(mcp: FastMCP) -> None:
         offset = max(0, offset)
         client = get_client()
         data = await client.ocs_get(f"{API}/collectives")
-        all_collectives = [_format_collective(c) for c in data["collectives"]]
+        visible = await _visible_ids(client)
+        all_collectives = [
+            _format_collective(c) for c in data["collectives"] if visible is None or c.get("id") in visible
+        ]
         page = all_collectives[offset : offset + limit]
         has_more = offset + limit < len(all_collectives)
 
@@ -224,11 +236,14 @@ def _register_search_tools(mcp: FastMCP) -> None:
         params: dict[str, Any] = {"limit": max(1, min(100, limit))}
         if query:
             params["query"] = query
-        data = await get_client().ocs_get(f"{API}/collectives/search/recent", params=params)
+        client = get_client()
+        data = await client.ocs_get(f"{API}/collectives/search/recent", params=params)
+        visible = await _visible_ids(client)
         return json.dumps(
             [
                 {**_format_page(p), "collective": p.get("collectiveNameWithEmoji"), "collective_id": _collective_id(p)}
                 for p in data.get("pages", [])
+                if visible is None or _collective_id(p) in visible
             ],
             default=str,
         )

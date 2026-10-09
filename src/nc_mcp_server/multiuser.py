@@ -21,6 +21,7 @@ Rules:
   with a per-process random key, so neither the password nor a plain hash of it is kept as a key.
 * A request can lower, never raise, the server's permission level with the
   ``X-Nextcloud-MCP-Permissions`` header (e.g. ``read`` for a read-only service account).
+  A login with a collectives group (``NEXTCLOUD_MCP_LOGIN_PATHS`` long form) is always ``read``.
 """
 
 import asyncio
@@ -44,7 +45,7 @@ from mcp.server.lowlevel.server import request_ctx
 
 from .client import NextcloudClient
 from .config import Config
-from .login_paths import prefixes_for
+from .login_paths import group_for, prefixes_for
 from .permissions import PermissionLevel, set_cap_provider
 
 log = logging.getLogger(__name__)
@@ -183,7 +184,13 @@ class ClientPool:
         self._clock = clock
         for login, prefixes in base.login_paths.items():
             # Visible at startup: a typo in a key would otherwise leave a login unrestricted.
-            log.info("Login %r (or user ID) restricted to: %s", login, ", ".join(prefixes))
+            group = base.login_collectives.get(login)
+            log.info(
+                "Login %r (or user ID) restricted to: %s%s",
+                login,
+                ", ".join(prefixes) or "(no folders)",
+                f"; read-only collectives of group {group!r}" if group else "",
+            )
         self._close_grace = close_grace
         self._key = secrets.token_bytes(32)
         self._entries: OrderedDict[str, _Entry] = OrderedDict()
@@ -224,6 +231,7 @@ class ClientPool:
                     is_app_password=True,
                     # NEXTCLOUD_MCP_LOGIN_PATHS: limits by login, fixed with the client.
                     path_prefixes=prefixes_for(self._base.login_paths, creds.login, user_id),
+                    collectives_group=group_for(self._base.login_collectives, creds.login, user_id),
                 )
                 entry = _Entry(client=NextcloudClient(config), config=config, last_used=self._clock())
             except BaseException as exc:
@@ -366,7 +374,11 @@ class MultiUserAuthMiddleware:
             log.warning("Login check failed: Nextcloud unavailable (%s)", exc)
             await _reply(send, 502, "Nextcloud is not reachable.")
             return
-        binding = Binding(client=client, config=config, permission_cap=lowest(self.server_level, cap))
+        level = lowest(self.server_level, cap)
+        if config.collectives_group is not None:
+            # A login with a collectives group only ever reads (NEXTCLOUD_MCP_LOGIN_PATHS long form).
+            level = lowest(level, PermissionLevel.READ)
+        binding = Binding(client=client, config=config, permission_cap=level)
         state = scope.setdefault("state", {})
         state[_SCOPE_KEY] = binding
         token = _binding.set(binding)
