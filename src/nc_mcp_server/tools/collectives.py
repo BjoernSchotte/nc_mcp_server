@@ -77,7 +77,11 @@ async def _moved_page(page_id: int, collective_id: int, parent_id: int, copied_t
 
 
 def _collective_id(page: dict[str, Any]) -> int | None:
-    """Recent pages carry no collective ID, but their collectivePath ends in it: "/<name>-<id>"."""
+    """The page's collective: its collectiveId when the server sends one, else the end of its
+    collectivePath ("/<name>-<id>"), which is all older Collectives versions give recent pages."""
+    cid = page.get("collectiveId")
+    if isinstance(cid, int) and not isinstance(cid, bool) and cid > 0:
+        return cid
     match = re.search(r"-(\d+)$", str(page.get("collectivePath") or ""))
     return int(match.group(1)) if match else None
 

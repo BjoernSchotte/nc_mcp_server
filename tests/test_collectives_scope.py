@@ -43,6 +43,8 @@ MEMBERS = {
 }
 RECENT = [
     {"id": 11, "title": "Treffen", "collectivePath": "/Vereinswiki-1"},
+    {"id": 12, "title": "Ausflug", "collectivePath": "/Irrefuehrend-1", "collectiveId": 2},
+    {"id": 13, "title": "Projektplan", "collectivePath": "/Projekte-9", "collectiveId": 3},
     {"id": 21, "title": "Geheim", "collectivePath": "/Vorstand intern-2"},
     {"id": 99, "title": "Ohne", "collectivePath": "/"},
 ]
@@ -265,6 +267,7 @@ class TestScope:
             {"userId": "Mitglieder", "userType": 1, "status": "Member", "level": 1},
             {"userId": "Mitglieder", "userType": 2, "status": "Invited", "level": 1},
             {"userId": "Mitglieder", "userType": 2, "status": "Member", "level": 0},
+            {"userId": "Mitglieder", "userType": 2, "level": 1},
         ],
     )
     async def test_near_misses_do_not_count(self, member: dict[str, Any]) -> None:
@@ -435,7 +438,9 @@ class TestToolsFilterLists:
 
     async def test_recent_pages_only_from_the_scope(self) -> None:
         out = await self._call(scoped_client([]), "list_recent_collective_pages")
-        assert [p["id"] for p in out] == [11]
+        # collectiveId wins over the path suffix when the server sends it
+        assert [p["id"] for p in out] == [11, 13]
+        assert [p["collective_id"] for p in out] == [1, 3]
 
     async def test_unrestricted_login_unchanged(self) -> None:
         client = NextcloudClient(Config(nextcloud_url=BASE, user="alice", password="pw", is_app_password=True))

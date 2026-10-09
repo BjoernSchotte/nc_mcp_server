@@ -92,7 +92,7 @@ def has_group(members: object, group: str) -> bool:
         if (
             m.get("userType") == GROUP_MEMBER
             and m.get("userId") == group
-            and m.get("status", "Member") == "Member"
+            and m.get("status") == "Member"
             and isinstance(level, int)
             and level >= 1
         ):
