@@ -736,11 +736,8 @@ class NextcloudClient:
         content_type = str(ct).split(";")[0].strip()
         return response.content or b"", content_type
 
-    async def _raise_if_locked(self, response: niquests.Response, path: str) -> None:
-        """HTTP 423 on a write: read who holds the lock (PROPFIND Depth 0) and say so. Never retried."""
-        if response.status_code != 423:
-            return
-        props: dict[str, str] = {}
+    async def _lock_props(self, path: str) -> dict[str, str]:
+        """The lock properties of a file (PROPFIND Depth 0), {} when they cannot be read."""
         try:
             info = await self._do_request(
                 "PROPFIND",
@@ -748,11 +745,22 @@ class NextcloudClient:
                 data=LOCK_PROPFIND_BODY,
                 headers={"Depth": "0", "Content-Type": "application/xml; charset=utf-8"},
             )
-            if info.status_code == 207:
-                props = parse_lock_props(info.text or "")
         except NextcloudError:
-            props = {}  # holder unknown; the message says so
-        raise NextcloudError(describe_lock(path, props, now=time.time(), timezone=self._config.timezone), 423)
+            return {}
+        return parse_lock_props(info.text or "") if info.status_code == 207 else {}
+
+    async def _raise_if_locked(self, response: niquests.Response, *paths: str) -> None:
+        """HTTP 423 on a write: read who holds the lock (PROPFIND Depth 0) and say so. Never retried.
+
+        With several paths (a move: source, then destination) the first locked one is named.
+        """
+        if response.status_code != 423:
+            return
+        for path in paths:
+            props = await self._lock_props(path)
+            if props.get("lock") == "1":
+                raise NextcloudError(describe_lock(path, props, now=time.time(), timezone=self._config.timezone), 423)
+        raise NextcloudError(describe_lock(paths[0], {}, now=time.time(), timezone=self._config.timezone), 423)
 
     async def dav_put(self, path: str, content: bytes, content_type: str = "application/octet-stream") -> None:
         """PUT (upload/overwrite) a file via WebDAV."""
@@ -827,7 +835,7 @@ class NextcloudClient:
             src_url,
             headers={"Destination": dest_url, "Overwrite": "F"},
         )
-        await self._raise_if_locked(response, source)
+        await self._raise_if_locked(response, source, destination)
         _raise_for_status(response, f"Move '{source}' to '{destination}'")
 
     # --- Trashbin DAV ---

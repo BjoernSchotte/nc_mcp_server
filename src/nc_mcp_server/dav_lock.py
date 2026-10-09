@@ -75,7 +75,10 @@ def describe_lock(path: str, props: dict[str, str], *, now: float, timezone: str
     if since is not None:
         parts.append(f"since {datetime.fromtimestamp(since, tz).strftime('%Y-%m-%d %H:%M')} {tz_name}")
     if timeout > 0 and since is not None:
-        parts.append(f"until {datetime.fromtimestamp(since + timeout, tz).strftime('%H:%M')} {tz_name}")
+        end = datetime.fromtimestamp(since + timeout, tz)
+        # Date only when the lock does not end today (in the configured zone).
+        fmt = "%H:%M" if end.date() == datetime.fromtimestamp(now, tz).date() else "%Y-%m-%d %H:%M"
+        parts.append(f"until {end.strftime(fmt)} {tz_name}")
     else:
         parts.append("without expiry")
     text = ", ".join(parts) + "."
